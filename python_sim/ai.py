@@ -113,8 +113,8 @@ def decide_restart_position(match: MatchState, team: Team, player: Player, confi
         return Intent(PlayerAction.PASS, match.ball.x, match.ball.y)
         
     if match.restart_reason == "Kickoff":
-        # Separation logic while returning to half
-        teammates_close = [p for p in team.players if p.player_id != player.player_id and player.player_id != match.ball.owner_player_id and distance(p.state.x, p.state.y, player.state.x, player.state.y) < 2.5]
+        # Separation logic — spread out from close teammates
+        teammates_close = [p for p in team.players if p.player_id != player.player_id and p.player_id != match.ball.owner_player_id and distance(p.state.x, p.state.y, player.state.x, player.state.y) < 2.5]
         if teammates_close:
             closest = min(teammates_close, key=lambda p: distance(p.state.x, p.state.y, player.state.x, player.state.y))
             angle_away = angle_to(closest.state.x, closest.state.y, player.state.x, player.state.y)
@@ -124,13 +124,12 @@ def decide_restart_position(match: MatchState, team: Team, player: Player, confi
             ty = clamp(ty, 0.0, config.pitch_height)
             return Intent(PlayerAction.RECOVER, tx, ty)
 
-        # Everyone retreats to their own half, except the taker who is already at the ball
-        home_x, home_y = role_home_position(team, player.role, config, attacking=False)
-        tx, ty = home_x, home_y
+        # Stay in own half, but don't retreat to defensive home position
         if team.attack_direction == 1:
-            tx = clamp(tx, 1.0, config.pitch_width / 2 - 2.0)
+            tx = clamp(player.state.x, 1.0, config.pitch_width / 2 - 2.0)
         else:
-            tx = clamp(tx, config.pitch_width / 2 + 2.0, config.pitch_width - 1.0)
+            tx = clamp(player.state.x, config.pitch_width / 2 + 2.0, config.pitch_width - 1.0)
+        ty = clamp(player.state.y, 1.0, config.pitch_height - 1.0)
         return Intent(PlayerAction.RECOVER, tx, ty)
         
     if match.restart_reason == "Corner":
@@ -141,28 +140,101 @@ def decide_restart_position(match: MatchState, team: Team, player: Player, confi
         is_attacking = (match.restart_team_id == team.team_id)
         goal_x = config.pitch_width if (team.attack_direction == 1 if is_attacking else team.attack_direction == -1) else 0.0
         
+        flank = _role_flank_sign(team, player.role)
         if is_attacking:
             if player.role == Role.ANCHOR:
                 tx = goal_x - team.attack_direction * 12.0
                 ty = config.pitch_height / 2
             else:
-                # 3 players scattered in the box
-                offset_y = -3.0 if player.role == Role.LEFT else (3.0 if player.role == Role.RIGHT else 0.0)
                 tx = goal_x - team.attack_direction * 4.0
-                ty = config.pitch_height / 2 + offset_y
+                ty = config.pitch_height / 2 + flank * 3.0
         else:
             if player.role == Role.PIVOT:
                 tx = goal_x + team.attack_direction * 12.0
                 ty = config.pitch_height / 2
             else:
-                offset_y = -2.0 if player.role == Role.LEFT else (2.0 if player.role == Role.RIGHT else 0.0)
                 tx = goal_x + team.attack_direction * 3.0
-                ty = config.pitch_height / 2 + offset_y
+                ty = config.pitch_height / 2 + flank * 2.0
                 
         return Intent(PlayerAction.RECOVER, clamp(tx, 0, config.pitch_width), clamp(ty, 0, config.pitch_height))
 
     target_x, target_y = structured_target(match, team, player, config, has_ball=match.restart_team_id == team.team_id)
     return Intent(PlayerAction.RECOVER, target_x, target_y)
+
+
+def choose_dribble_target(
+    player: Player,
+    team: Team,
+    opponents: list[Player],
+    config: MatchConfig,
+) -> tuple[float, float]:
+    """Sample positions in a forward arc and pick the one with best balance of
+    forward progress, open space, and defender avoidance.
+    When close to goal, bias strongly toward goal instead of dodging defenders."""
+    px, py = player.state.x, player.state.y
+    goal_x = config.pitch_width if team.attack_direction == 1 else 0.0
+    dist_to_goal = abs(goal_x - px)
+
+    # In shooting range: prioritise driving toward goal, not dodging defenders
+    if dist_to_goal < config.shot_range:
+        goal_proximity = 1.0 - dist_to_goal / config.shot_range  # 0 at edge, 1 at goal line
+        half_arc = math.radians(30 + 45 * (1.0 - goal_proximity))  # narrow → wide as distance grows
+        def_weight = config.open_space_defender_weight * (1.0 - goal_proximity)  # fade out near goal
+        fwd_bias = config.dribble_forward_bias * (1.0 + goal_proximity * 3.0)  # up to 4x near goal
+    else:
+        half_arc = math.radians(75)
+        def_weight = config.open_space_defender_weight
+        fwd_bias = config.dribble_forward_bias
+
+    base_angle = 0.0 if team.attack_direction == 1 else math.pi
+    radii = [config.open_space_radius / 3, config.open_space_radius * 2 / 3, config.open_space_radius]
+    n_angles = max(4, config.open_space_samples // len(radii))
+
+    best_x, best_y = px, py
+    best_score = -9999.0
+
+    for r in radii:
+        for i in range(n_angles):
+            angle = base_angle + half_arc * (2.0 * i / (n_angles - 1) - 1.0) if n_angles > 1 else base_angle
+            cx = px + math.cos(angle) * r
+            cy = py + math.sin(angle) * r
+            cx = clamp(cx, 1.0, config.pitch_width - 1.0)
+            cy = clamp(cy, 1.0, config.pitch_height - 1.0)
+
+            # Forward progress
+            forward = (cx - px) * team.attack_direction * fwd_bias
+
+            # Defender avoidance (faded near goal)
+            min_def_dist = min((distance(cx, cy, o.state.x, o.state.y) for o in opponents), default=99.0)
+            defender_score = min(min_def_dist, 5.0) * def_weight
+
+            # Sideline penalty
+            sideline_dist = min(cy, config.pitch_height - cy, cx, config.pitch_width - cx)
+            sideline_penalty = -max(0.0, 2.0 - sideline_dist) * 2.0
+
+            # Don't wander too far in one tick
+            dist_penalty = -distance(px, py, cx, cy) * 0.2
+
+            # Avoid crowding teammates (mild)
+            teammate_penalty = 0.0
+            for mate in team.players:
+                if mate.player_id == player.player_id:
+                    continue
+                d = distance(cx, cy, mate.state.x, mate.state.y)
+                if d < 1.5:
+                    teammate_penalty -= (1.5 - d) * 1.5
+
+            score = forward + defender_score + sideline_penalty + dist_penalty + teammate_penalty
+            if score > best_score:
+                best_score = score
+                best_x, best_y = cx, cy
+
+    # Fallback: at least move forward a bit
+    if best_score <= -9990.0:
+        best_x = clamp(px + team.attack_direction * 1.5, 1.0, config.pitch_width - 1.0)
+        best_y = py
+
+    return (best_x, best_y)
 
 
 def decide_ball_owner(
@@ -175,7 +247,9 @@ def decide_ball_owner(
     if player.role == Role.GK:
         pass_target, _ = score_best_pass(match, team, player, config)
         if pass_target is not None:
-            return Intent(PlayerAction.PASS, pass_target.state.x, pass_target.state.y, pass_target.player_id, PassType.TO_FEET)
+            pass_type = choose_pass_type(team, player, pass_target, 99.0, config)
+            pass_speed = choose_pass_speed(player, pass_target, pass_type, 99.0, config)
+            return Intent(PlayerAction.PASS, pass_target.state.x, pass_target.state.y, pass_target.player_id, pass_type, pass_speed)
         return Intent(PlayerAction.DRIBBLE, player.state.x + team.attack_direction * 1.5, player.state.y)
     nearest_defender = nearest_opponent(match, player)
     defender_dist = (
@@ -184,58 +258,78 @@ def decide_ball_owner(
         else 99.0
     )
     
-    # Force a pass if this is the start of a kickoff
-    if match.restart_reason == "Kickoff" and match.ball.last_touch_action is None:
+    # Force a pass for any restart (kickoff, throw-in, corner, goal kick)
+    if match.restart_reason and match.ball.last_touch_action is None:
         pass_target, _ = score_best_pass(match, team, player, config)
         if pass_target is not None:
-            pass_type = choose_pass_type(team, player, pass_target, config)
-            return Intent(PlayerAction.PASS, pass_target.state.x, pass_target.state.y, pass_target.player_id, pass_type)
+            pass_type = choose_pass_type(team, player, pass_target, defender_dist, config)
+            pass_speed = choose_pass_speed(player, pass_target, pass_type, defender_dist, config)
+            return Intent(PlayerAction.PASS, pass_target.state.x, pass_target.state.y, pass_target.player_id, pass_type, pass_speed)
         else:
-            # Fallback
-            mate = [p for p in team.players if p.player_id != player.player_id][0]
-            return Intent(PlayerAction.PASS, mate.state.x, mate.state.y, mate.player_id, PassType.TO_FEET)
+            mate = min([p for p in team.players if p.player_id != player.player_id],
+                       key=lambda p: distance(player.state.x, player.state.y, p.state.x, p.state.y))
+            pass_speed = choose_pass_speed(player, mate, PassType.TO_FEET, defender_dist, config)
+            return Intent(PlayerAction.PASS, mate.state.x, mate.state.y, mate.player_id, PassType.TO_FEET, pass_speed)
 
     shoot_score = score_shot(match, team, player, defender_dist, config)
     pass_target, pass_score = score_best_pass(match, team, player, config)
     dribble_score = score_dribble(match, team, player, defender_dist, config)
 
     noisy = [
-        (PlayerAction.SHOOT, shoot_score + rng.uniform(-0.3, 0.3), None),
-        (PlayerAction.PASS, pass_score + rng.uniform(-0.3, 0.3), pass_target),
-        (PlayerAction.DRIBBLE, dribble_score + rng.uniform(-0.3, 0.3), None),
+        (PlayerAction.SHOOT, shoot_score + rng.uniform(-0.1, 0.1), None),
+        (PlayerAction.PASS, pass_score + rng.uniform(-0.1, 0.1), pass_target),
+        (PlayerAction.DRIBBLE, dribble_score + rng.uniform(-0.1, 0.1), None),
     ]
     best_action, _, target = max(noisy, key=lambda item: item[1])
     if best_action == PlayerAction.PASS and target is not None:
-        pass_type = choose_pass_type(team, player, target, config)
-        return Intent(PlayerAction.PASS, target.state.x, target.state.y, target.player_id, pass_type)
+        pass_type = choose_pass_type(team, player, target, defender_dist, config)
+        pass_speed = choose_pass_speed(player, target, pass_type, defender_dist, config)
+        return Intent(PlayerAction.PASS, target.state.x, target.state.y, target.player_id, pass_type, pass_speed)
     if best_action == PlayerAction.SHOOT:
         goal_x = config.pitch_width if team.attack_direction == 1 else 0.0
         half_h = config.pitch_height / 2
         aim_y = half_h + config.goal_width / 2 - 0.5 if player.state.y < half_h else half_h - config.goal_width / 2 + 0.5
         return Intent(PlayerAction.SHOOT, goal_x, aim_y)
-        
-    forward_x = player.state.x + team.attack_direction * config.support_distance * 0.4
-    forward_x = clamp(forward_x, 0.0, config.pitch_width)
-    
-    # Angle the dribble towards the goal if we are past the midway mark
-    goal_x = config.pitch_width if team.attack_direction == 1 else 0.0
-    dist_x = abs(goal_x - player.state.x)
-    if dist_x < config.pitch_width * 0.4:
-        target_y = player.state.y + (config.pitch_height / 2 - player.state.y) * 0.4
-    else:
-        target_y = player.state.y
-        
-    return Intent(PlayerAction.DRIBBLE, forward_x, target_y)
+
+    opponents = get_opponent_team(match, team.team_id).players
+    dribble_x, dribble_y = choose_dribble_target(player, team, opponents, config)
+    return Intent(PlayerAction.DRIBBLE, dribble_x, dribble_y)
 
 
 def decide_off_ball(match: MatchState, team: Team, player: Player, config: MatchConfig) -> Intent:
     if match.ball.owner_team_id is None:
-        intercept = choose_intercept_point(match, player, config)
-        if intercept is not None:
-            ix, iy, mode = intercept
-            player.state.receive_mode = mode
-            return Intent(PlayerAction.SUPPORT, ix, iy)
-        player.state.receive_mode = ReceiveMode.NONE
+        # Ball is in flight — check passer/receiver state
+        is_own_pass = (
+            match.passer_player_id is not None
+            and match.ball.last_touch_team_id == team.team_id
+        )
+
+        if player.player_id == match.receiver_player_id:
+            # I'm the designated receiver: meet the ball
+            intercept = choose_intercept_point(match, player, config)
+            if intercept is not None:
+                ix, iy, mode = intercept
+                player.state.receive_mode = mode
+                return Intent(PlayerAction.SUPPORT, ix, iy)
+            player.state.receive_mode = ReceiveMode.NONE
+            # Fall through to support if ball is unreachable
+
+        elif is_own_pass:
+            # My team's pass is in flight, I'm not the receiver: support only
+            target_x, target_y = structured_target(match, team, player, config, has_ball=True)
+            action = PlayerAction.SUPPORT if player.role in (Role.ANCHOR, Role.PIVOT) else PlayerAction.SPREAD
+            player.state.receive_mode = ReceiveMode.NONE
+            return Intent(action, target_x, target_y)
+
+        else:
+            # Opponent's pass or loose ball: try to intercept
+            intercept = choose_intercept_point(match, player, config)
+            if intercept is not None:
+                ix, iy, mode = intercept
+                player.state.receive_mode = mode
+                return Intent(PlayerAction.SUPPORT, ix, iy)
+            player.state.receive_mode = ReceiveMode.NONE
+
     if match.ball.owner_team_id == team.team_id:
         target_x, target_y = structured_target(match, team, player, config, has_ball=True)
         action = PlayerAction.SUPPORT if player.role in (Role.ANCHOR, Role.PIVOT) else PlayerAction.SPREAD
@@ -246,14 +340,43 @@ def decide_off_ball(match: MatchState, team: Team, player: Player, config: Match
     return Intent(action, target_x, target_y)
 
 
-def choose_pass_type(team: Team, player: Player, target: Player, config: MatchConfig) -> PassType:
+def choose_pass_type(team: Team, player: Player, target: Player, nearest_defender_dist: float, config: MatchConfig) -> PassType:
+    dist = distance(player.state.x, player.state.y, target.state.x, target.state.y)
     forward_value = (target.state.x - player.state.x) * team.attack_direction
     lateral_gap = abs(target.state.y - player.state.y)
-    if target.role == Role.PIVOT and forward_value > 4.0:
+    if (
+        target.role == Role.PIVOT
+        and forward_value > 3.0
+        and dist > 5.0
+        and nearest_defender_dist > 1.8
+        and team.state.phase == TeamPhase.POSSESSION_ATTACK
+    ):
         return PassType.THROUGH_PASS
-    if forward_value > 2.0 or lateral_gap > 4.0:
+    if forward_value > 2.0 or lateral_gap > 4.0 or dist > 10.0:
         return PassType.LEAD_PASS
     return PassType.TO_FEET
+
+
+def choose_pass_speed(
+    player: Player,
+    target: Player,
+    pass_type: PassType,
+    nearest_defender_dist: float,
+    config: MatchConfig,
+) -> float:
+    dist = distance(player.state.x, player.state.y, target.state.x, target.state.y)
+    speed = config.pass_speed_min + dist * config.pass_speed_distance_per_m
+    if pass_type == PassType.THROUGH_PASS:
+        speed += config.pass_speed_type_through_bonus
+    elif pass_type == PassType.LEAD_PASS:
+        speed += config.pass_speed_type_lead_bonus
+    if nearest_defender_dist < 3.0:
+        speed += (3.0 - nearest_defender_dist) * config.pass_speed_pressure_malus
+    quality = player.derived.pass_quality / 100.0
+    max_speed = config.pass_speed_min + (config.pass_speed_max - config.pass_speed_min) * quality
+    # Ensure the ball can physically reach the target under deceleration
+    min_reach_speed = math.sqrt(2.0 * config.ball_deceleration * dist * 1.05)
+    return clamp(speed, max(config.pass_speed_min, min_reach_speed), max_speed)
 
 
 def choose_intercept_point(match: MatchState, player: Player, config: MatchConfig) -> tuple[float, float, ReceiveMode] | None:
@@ -307,14 +430,32 @@ def predict_ball_path(
     for _ in range(steps):
         px += pvx * config.tick_seconds
         py += pvy * config.tick_seconds
-        pvx *= config.ball_friction
-        pvy *= config.ball_friction
+        speed = math.hypot(pvx, pvy)
+        if speed > 0.0:
+            decel = config.ball_deceleration * config.tick_seconds
+            if speed <= decel:
+                pvx, pvy = 0.0, 0.0
+            else:
+                factor = (speed - decel) / speed
+                pvx *= factor
+                pvy *= factor
         points.append((clamp(px, 0.0, config.pitch_width), clamp(py, 0.0, config.pitch_height)))
     return points
 
 
+def _role_flank_sign(team: Team, role: Role) -> float:
+    """Returns +1 or -1 for y-offset relative to pitch centre, accounting for attack direction.
+    LEFT flank is always the left side when facing opponent goal."""
+    if role == Role.LEFT:
+        return -team.attack_direction
+    if role == Role.RIGHT:
+        return team.attack_direction
+    return 0.0
+
+
 def role_home_position(team: Team, role: Role, config: MatchConfig, attacking: bool) -> tuple[float, float]:
     half_h = config.pitch_height / 2
+    flank = _role_flank_sign(team, role)
     left_x = 7 if team.attack_direction == 1 else config.pitch_width - 7
     mid_x = 12 if team.attack_direction == 1 else config.pitch_width - 12
     high_x = 18 if team.attack_direction == 1 else config.pitch_width - 18
@@ -326,11 +467,69 @@ def role_home_position(team: Team, role: Role, config: MatchConfig, attacking: b
         return (3 if team.attack_direction == 1 else config.pitch_width - 3, half_h)
     if role == Role.ANCHOR:
         return (left_x, half_h)
-    if role == Role.LEFT:
-        return (mid_x, half_h - 5.5)
-    if role == Role.RIGHT:
-        return (mid_x, half_h + 5.5)
+    if role == Role.LEFT or role == Role.RIGHT:
+        return (mid_x, half_h + flank * 5.5)
     return (high_x, half_h)
+
+
+def _find_open_support_position(
+    player: Player,
+    team: Team,
+    match: MatchState,
+    base_x: float,
+    base_y: float,
+    ball_x: float,
+    ball_y: float,
+    config: MatchConfig,
+) -> tuple[float, float]:
+    """Sample positions around base, pick the one with least defensive pressure
+    and best passing lane from ball carrier."""
+    opp_team = get_opponent_team(match, team.team_id)
+    opponents = opp_team.players
+    teammates = [p for p in team.players if p.player_id != player.player_id]
+
+    best_x, best_y = base_x, base_y
+    best_score = -9999.0
+    radii = [config.open_space_radius / 3, config.open_space_radius * 2 / 3, config.open_space_radius]
+    n_angles = max(4, config.open_space_samples // len(radii))
+
+    for r in radii:
+        for i in range(n_angles):
+            angle = math.tau * i / n_angles
+            cx = clamp(base_x + math.cos(angle) * r, 2.0, config.pitch_width - 2.0)
+            cy = clamp(base_y + math.sin(angle) * r, 2.0, config.pitch_height - 2.0)
+
+            # Defender avoidance (primary)
+            min_def_dist = min((distance(cx, cy, o.state.x, o.state.y) for o in opponents), default=99.0)
+            defender_score = min(min_def_dist, 5.0) * config.open_space_defender_weight
+
+            # Passing lane quality: distance from ball→candidate line to each opponent
+            lane_pen = 0.0
+            for opp in opponents:
+                dist_to_lane = distance_to_segment(opp.state.x, opp.state.y, ball_x, ball_y, cx, cy)
+                if dist_to_lane < 1.8:
+                    lane_pen += (1.8 - dist_to_lane) * config.support_lane_weight * 2.0
+
+            # Forward progress
+            forward = (cx - base_x) * team.attack_direction * 0.3
+
+            # Teammate separation
+            teammate_pen = 0.0
+            for mate in teammates:
+                d = distance(cx, cy, mate.state.x, mate.state.y)
+                if d < 2.0:
+                    teammate_pen -= (2.0 - d) * 1.0
+
+            # Sideline avoidance
+            sideline_dist = min(cy, config.pitch_height - cy, cx, config.pitch_width - cx)
+            sideline_pen = -max(0.0, 1.5 - sideline_dist) * 2.0
+
+            score = defender_score - lane_pen + forward + teammate_pen + sideline_pen
+            if score > best_score:
+                best_score = score
+                best_x, best_y = cx, cy
+
+    return (best_x, best_y)
 
 
 def structured_target(match: MatchState, team: Team, player: Player, config: MatchConfig, has_ball: bool) -> tuple[float, float]:
@@ -350,21 +549,17 @@ def structured_target(match: MatchState, team: Team, player: Player, config: Mat
         return (clamp(tx, 0, config.pitch_width), clamp(ty, 0, config.pitch_height))
 
     home_x, home_y = role_home_position(team, player.role, config, attacking=has_ball)
+    flank = _role_flank_sign(team, player.role)
     if has_ball:
         if player.role == Role.ANCHOR:
             tx, ty = (
                 clamp(ball_x - team.attack_direction * 5.0, 5.0, config.pitch_width - 5.0),
                 clamp((ball_y + half_h) / 2, 3.0, config.pitch_height - 3.0),
             )
-        elif player.role == Role.LEFT:
+        elif player.role in (Role.LEFT, Role.RIGHT):
             tx, ty = (
                 clamp(max(home_x, ball_x + team.attack_direction * 1.5), 5.0, config.pitch_width - 5.0),
-                clamp(half_h - 7.0, 2.0, config.pitch_height - 2.0),
-            )
-        elif player.role == Role.RIGHT:
-            tx, ty = (
-                clamp(max(home_x, ball_x + team.attack_direction * 1.5), 5.0, config.pitch_width - 5.0),
-                clamp(half_h + 7.0, 2.0, config.pitch_height - 2.0),
+                clamp(half_h + flank * 7.0, 2.0, config.pitch_height - 2.0),
             )
         elif player.role == Role.PIVOT:
             tx, ty = (
@@ -374,24 +569,11 @@ def structured_target(match: MatchState, team: Team, player: Player, config: Mat
         else:
             tx, ty = home_x, home_y
             
-        # Support logic: if the team has the ball but I am not the owner, find an open passing lane
+        # Support logic: if the team has the ball but I am not the owner, find open space
         if match.ball.owner_player_id != player.player_id:
-            opp_team = get_opponent_team(match, team.team_id)
-            best_x, best_y, best_score = tx, ty, -9999.0
-            offsets = [(0, 0), (0, 3.5), (0, -3.5), (2.5, 3.5), (2.5, -3.5), (-2.5, 3.5), (-2.5, -3.5)]
-            for dx, dy in offsets:
-                cx = clamp(tx + dx, 2.0, config.pitch_width - 2.0)
-                cy = clamp(ty + dy, 2.0, config.pitch_height - 2.0)
-                lane_pen = 0.0
-                for opp in opp_team.players:
-                    dist_to_lane = distance_to_segment(opp.state.x, opp.state.y, ball_x, ball_y, cx, cy)
-                    if dist_to_lane < 1.8:
-                        lane_pen += (1.8 - dist_to_lane) * 3.0
-                score = -lane_pen - math.hypot(dx, dy) * 0.2
-                if score > best_score:
-                    best_score = score
-                    best_x, best_y = cx, cy
-            tx, ty = best_x, best_y
+            tx, ty = _find_open_support_position(
+                player, team, match, tx, ty, ball_x, ball_y, config,
+            )
             
         return (tx, ty)
     return (home_x, home_y)
@@ -442,16 +624,36 @@ def defending_target(
     if is_presser:
         return (owner.state.x, owner.state.y, PlayerAction.PRESS)
 
-    # Check spatial separation logic: if another active non-GK teammate is too close, prioritize staying apart
-    teammates_close = [p for p in team.players if p.player_id != player.player_id and distance(p.state.x, p.state.y, player.state.x, player.state.y) < 3.0]
-    if teammates_close:
-        # Move away from closest teammate
-        closest = min(teammates_close, key=lambda p: distance(p.state.x, p.state.y, player.state.x, player.state.y))
-        angle_away = angle_to(closest.state.x, closest.state.y, player.state.x, player.state.y)
-        tx = player.state.x + math.cos(angle_away) * 3.0
-        ty = player.state.y + math.sin(angle_away) * 3.0
-        # Never leave your own half un-manned completely if you are the anchor
-        return (clamp(tx, 0, config.pitch_width), clamp(ty, 0, config.pitch_height), PlayerAction.RECOVER)
+    # Non-pressing defender: find a dangerous opponent to mark or intercept the passing lane
+    opp_team = get_opponent_team(match, team.team_id)
+    ball_carrier = owner
+
+    # Find the most dangerous opponent (excluding the ball carrier)
+    best_danger = -9999.0
+    mark_target = None
+    for opp in opp_team.players:
+        if ball_carrier and opp.player_id == ball_carrier.player_id:
+            continue
+        forward_pos = opp.state.x * team.attack_direction * (-1)  # how close to our goal
+        danger = forward_pos * 1.5
+        if opp.role == Role.PIVOT:
+            danger += 2.0
+        danger -= distance(ball_carrier.state.x, ball_carrier.state.y, opp.state.x, opp.state.y) * 0.08 if ball_carrier else 0.0
+        if danger > best_danger:
+            best_danger = danger
+            mark_target = opp
+
+    if ball_carrier and mark_target:
+        # Position between ball carrier and the dangerous opponent to intercept a pass
+        ratio = config.mark_intercept_ratio
+        tx = ball_carrier.state.x + (mark_target.state.x - ball_carrier.state.x) * ratio
+        ty = ball_carrier.state.y + (mark_target.state.y - ball_carrier.state.y) * ratio
+        # Nudge slightly toward the dangerous opponent to close down space
+        tx = clamp(tx, 2.0, config.pitch_width - 2.0)
+        ty = clamp(ty, 2.0, config.pitch_height - 2.0)
+        return (tx, ty, PlayerAction.RECOVER)
+
+    # Fallback: home position with block shift
     base_x, base_y = role_home_position(team, player.role, config, attacking=False)
     block_shift = -2.5 if team.attack_direction == 1 else 2.5
     if team.state.phase == TeamPhase.HIGH_PRESS:

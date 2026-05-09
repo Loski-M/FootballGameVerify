@@ -4,7 +4,7 @@ import math
 from .models import Role
 import random
 
-from python_sim.ai import angle_to, clamp, decide_all_players, distance, get_owner_player, normalize_angle, update_team_phase
+from python_sim.ai import angle_to, clamp, decide_all_players, distance, get_owner_player, normalize_angle, role_home_position, update_team_phase
 from python_sim.config import MatchConfig
 from python_sim.models import (
     BallSnapshot,
@@ -99,13 +99,38 @@ class MatchSimulator:
             return
         team_stats = match.stats[owner.team_id]
         team_stats.passes_attempted += 1
-        quality = owner.derived.pass_quality / 100.0
-        desired_x, desired_y = self._resolve_pass_target(owner, target, owner.state.intent.pass_type)
+
+        desired_x, desired_y = self._resolve_pass_target(owner, target, match)
+
+        speed = owner.state.intent.pass_speed if owner.state.intent.pass_speed > 0 else self.config.pass_speed
+
         desired_angle = angle_to(owner.state.x, owner.state.y, desired_x, desired_y)
         facing_gap = abs(normalize_angle(desired_angle - owner.state.facing_angle)) / math.pi
-        error_scale = max(0.2, 1.1 - quality) + facing_gap * 0.55
-        tx = desired_x + self.rng.uniform(-1.2, 1.2) * error_scale
-        ty = desired_y + self.rng.uniform(-0.9, 0.9) * error_scale
+
+        quality = owner.derived.pass_quality / 100.0
+        dist_m = math.hypot(desired_x - owner.state.x, desired_y - owner.state.y)
+        speed_factor = clamp(
+            (speed - self.config.pass_speed_min) / max(1.0, self.config.pass_speed_max - self.config.pass_speed_min),
+            0.0, 1.0,
+        )
+
+        error_std = (
+            self.config.pass_error_base
+            + (1.0 - quality) * self.config.pass_error_quality_factor
+            + dist_m * self.config.pass_error_distance_per_m
+            + speed_factor * self.config.pass_error_speed_factor
+            + facing_gap * self.config.pass_error_facing_factor
+        )
+        error_std = max(self.config.pass_error_base, error_std)
+
+        u1 = self.rng.uniform(0.001, 0.999)
+        u2 = self.rng.uniform(0.001, 0.999)
+        gauss_x = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+        gauss_y = math.sqrt(-2.0 * math.log(u1)) * math.sin(2.0 * math.pi * u2)
+
+        tx = clamp(desired_x + gauss_x * error_std, 0.5, self.config.pitch_width - 0.5)
+        ty = clamp(desired_y + gauss_y * error_std, 0.5, self.config.pitch_height - 0.5)
+
         dx = tx - owner.state.x
         dy = ty - owner.state.y
         dist = math.hypot(dx, dy) or 1.0
@@ -113,14 +138,20 @@ class MatchSimulator:
         match.ball.owner_team_id = None
         owner.state.has_ball = False
         owner.state.target_facing_angle = angle_to(owner.state.x, owner.state.y, tx, ty)
-        match.ball.vx = dx / dist * self.config.pass_speed
-        match.ball.vy = dy / dist * self.config.pass_speed
+        match.ball.vx = dx / dist * speed
+        match.ball.vy = dy / dist * speed
         match.ball.last_touch_team_id = owner.team_id
         match.ball.last_touch_player_id = owner.player_id
         match.ball.last_touch_action = PlayerAction.PASS
         match.restart_reason = ""
+        match.passer_player_id = owner.player_id
+        match.receiver_player_id = target_player_id
         pass_suffix = f" ({owner.state.intent.pass_type.value})" if owner.state.intent.pass_type else ""
         self._log(match, f"{owner.name} attempts a pass to {target.name}{pass_suffix}")
+
+    def _clear_pass_intent(self, match: MatchState) -> None:
+        match.passer_player_id = None
+        match.receiver_player_id = None
 
     def _execute_shot(self, match: MatchState, owner: Player) -> None:
         team_stats = match.stats[owner.team_id]
@@ -183,8 +214,17 @@ class MatchSimulator:
             return
         match.ball.x += match.ball.vx * self.config.tick_seconds
         match.ball.y += match.ball.vy * self.config.tick_seconds
-        match.ball.vx *= self.config.ball_friction
-        match.ball.vy *= self.config.ball_friction
+        # Uniform deceleration: reduce speed linearly each tick
+        speed = math.hypot(match.ball.vx, match.ball.vy)
+        if speed > 0.0:
+            decel = self.config.ball_deceleration * self.config.tick_seconds
+            if speed <= decel:
+                match.ball.vx = 0.0
+                match.ball.vy = 0.0
+            else:
+                factor = (speed - decel) / speed
+                match.ball.vx *= factor
+                match.ball.vy *= factor
 
         if match.ball.y < 0.0 or match.ball.y > self.config.pitch_height:
             self._set_throw_in(match)
@@ -218,6 +258,7 @@ class MatchSimulator:
         match.ball.owner_player_id = player.player_id
         match.ball.owner_team_id = player.team_id
         player.state.has_ball = True
+        self._clear_pass_intent(match)
         player.state.intercept_x = None
         player.state.intercept_y = None
         player.state.intercept_locked_until = 0.0
@@ -257,6 +298,7 @@ class MatchSimulator:
                 match.ball.last_touch_action = None
                 match.stats[opponent.team_id].tackles_won += 1
                 self._team_by_id(match, opponent.team_id).state.last_gain_time = match.time_seconds
+                self._clear_pass_intent(match)
                 self._log(match, f"{opponent.name} wins the ball from {owner.name}")
                 return
 
@@ -271,6 +313,7 @@ class MatchSimulator:
         return None
 
     def _handle_goal(self, match: MatchState, scoring_team_id: str) -> None:
+        self._clear_pass_intent(match)
         match.stats[scoring_team_id].goals += 1
         if (
             match.ball.last_touch_action == PlayerAction.SHOOT
@@ -285,11 +328,19 @@ class MatchSimulator:
         for team in match.teams:
             for player in team.players:
                 player.state.has_ball = False
-                # Do NOT forcibly teleport them into a diagonal line. Let them run back to own half.
                 player.state.decision_cooldown = 0.0
                 player.state.intercept_x = None
                 player.state.intercept_y = None
                 player.state.intercept_locked_until = 0.0
+                player.state.vx = 0.0
+                player.state.vy = 0.0
+                # Teleport both teams to defensive home positions (kickoff formation)
+                home_x, home_y = role_home_position(team, player.role, self.config, attacking=False)
+                player.state.x = home_x
+                player.state.y = home_y
+                # Both teams face opponent goal
+                player.state.facing_angle = 0.0 if team.attack_direction == 1 else math.pi
+                player.state.target_facing_angle = player.state.facing_angle
 
         match.ball = BallState(
             x=self.config.pitch_width / 2,
@@ -360,6 +411,7 @@ class MatchSimulator:
         match.ball.last_touch_team_id = keeper.team_id
         match.ball.last_touch_player_id = keeper.player_id
         match.ball.last_touch_action = None
+        self._clear_pass_intent(match)
         team.state.last_gain_time = match.time_seconds
         self._log(match, f"{keeper.name} saves the shot")
         return True
@@ -428,6 +480,7 @@ class MatchSimulator:
                 self._setup_restart(match, defending_team, self.config.pitch_width - 3.0, self.config.pitch_height / 2, "GoalKick")
 
     def _setup_restart(self, match: MatchState, team_id: str, x: float, y: float, reason: str) -> None:
+        self._clear_pass_intent(match)
         match.dead_ball = True
         match.restart_team_id = team_id
         match.restart_reason = reason
@@ -450,6 +503,7 @@ class MatchSimulator:
         match.ball.y = y
         match.ball.vx = 0.0
         match.ball.vy = 0.0
+        match.ball.last_touch_action = None
         self._team_by_id(match, team_id).state.last_gain_time = match.time_seconds
         self._log(match, f"{reason} for {self._team_by_id(match, team_id).name}")
 
@@ -525,16 +579,77 @@ class MatchSimulator:
         )
         match.frames.append(frame)
 
-    def _resolve_pass_target(self, owner: Player, target: Player, pass_type: PassType | None) -> tuple[float, float]:
+    def _resolve_pass_target(self, owner: Player, target: Player, match: MatchState) -> tuple[float, float]:
+        pass_type = owner.state.intent.pass_type
         if pass_type is None or pass_type == PassType.TO_FEET:
             return (target.state.x, target.state.y)
-        lead_time = 0.55 if pass_type == PassType.LEAD_PASS else 0.85
+
+        ball_speed = owner.state.intent.pass_speed if owner.state.intent.pass_speed > 0 else self.config.pass_speed
+        base_dist = math.hypot(target.state.x - owner.state.x, target.state.y - owner.state.y)
+
+        # Flight time with uniform deceleration: d = v0*t - 0.5*a*t^2
+        a = self.config.ball_deceleration
+        max_reach = ball_speed * ball_speed / (2.0 * a)
+        if base_dist >= max_reach:
+            estimated_flight_time = ball_speed / a  # ball stops at max distance
+        else:
+            estimated_flight_time = (ball_speed - math.sqrt(ball_speed * ball_speed - 2.0 * a * base_dist)) / a
+
+        receiver_speed = math.hypot(target.state.vx, target.state.vy)
+
+        # Prediction quality: passer's attack_awareness affects lead time accuracy
+        pred_quality = owner.attrs.attack_awareness / 100.0
+        receiver_factor = self.config.lead_time_receiver_speed_factor * (0.5 + pred_quality * self.config.lead_prediction_quality_factor)
+
+        lead_time = (
+            self.config.lead_time_min
+            + estimated_flight_time * self.config.lead_time_flight_fraction
+            + receiver_speed * receiver_factor
+        )
+
+        if pass_type == PassType.THROUGH_PASS:
+            lead_time += self.config.lead_time_through_extra
+
         predicted_x = target.state.x + target.state.vx * lead_time
         predicted_y = target.state.y + target.state.vy * lead_time
+
         if pass_type == PassType.THROUGH_PASS:
-            direction = 1 if owner.team_id == "A" else -1
-            predicted_x += direction * 2.5
+            owner_team = self._team_by_id(match, owner.team_id)
+            forward_offset = owner_team.attack_direction * min(3.5, base_dist * 0.25)
+            predicted_x += forward_offset
+
+        # If the predicted lead point is far outside the pitch, fall back to TO_FEET
+        margin = 2.0
+        if (predicted_x < -margin or predicted_x > self.config.pitch_width + margin or
+                predicted_y < -margin or predicted_y > self.config.pitch_height + margin):
+            return (target.state.x, target.state.y)
+
+        predicted_x, predicted_y = self._nudge_away_from_defenders(match, owner, predicted_x, predicted_y)
+
         return (
-            clamp(predicted_x, 0.0, self.config.pitch_width),
-            clamp(predicted_y, 0.0, self.config.pitch_height),
+            clamp(predicted_x, 1.5, self.config.pitch_width - 1.5),
+            clamp(predicted_y, 1.5, self.config.pitch_height - 1.5),
         )
+
+    def _nudge_away_from_defenders(
+        self, match: MatchState, owner: Player, target_x: float, target_y: float
+    ) -> tuple[float, float]:
+        opponents = [p for t in match.teams if t.team_id != owner.team_id for p in t.players]
+        best_nudge_x, best_nudge_y = target_x, target_y
+        best_score = -9999.0
+        offsets = [(0.0, 0.0), (1.5, 0.0), (-1.5, 0.0), (0.0, 1.5), (0.0, -1.5),
+                   (1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)]
+        for dx, dy in offsets:
+            cx = clamp(target_x + dx, 1.5, self.config.pitch_width - 1.5)
+            cy = clamp(target_y + dy, 1.5, self.config.pitch_height - 1.5)
+            penalty = 0.0
+            for opp in opponents:
+                d = math.hypot(cx - opp.state.x, cy - opp.state.y)
+                if d < self.config.lead_defender_nudge_radius:
+                    penalty += (self.config.lead_defender_nudge_radius - d) * 2.0
+            offset_penalty = math.hypot(dx, dy) * 0.15
+            score = -(penalty + offset_penalty)
+            if score > best_score:
+                best_score = score
+                best_nudge_x, best_nudge_y = cx, cy
+        return best_nudge_x, best_nudge_y

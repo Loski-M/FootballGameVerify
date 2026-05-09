@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python run_match.py)",
+      "Bash(python -c \"from python_sim.visualizer import show_match_replay; print\\('visualizer imports OK'\\)\")"
+    ]
+  }
+}

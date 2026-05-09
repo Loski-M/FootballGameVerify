@@ -77,6 +77,7 @@ class Intent:
     target_y: float = 0.0
     target_player_id: Optional[str] = None
     pass_type: Optional[PassType] = None
+    pass_speed: float = 0.0
 
 
 @dataclass(slots=True)
@@ -215,3 +216,5 @@ class MatchState:
     dead_ball: bool = False
     restart_team_id: Optional[str] = None
     restart_reason: str = ""
+    passer_player_id: Optional[str] = None
+    receiver_player_id: Optional[str] = None

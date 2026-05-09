@@ -13,7 +13,42 @@ class MatchConfig:
     ball_control_radius: float = 1.0
     pass_speed: float = 12.0
     shot_speed: float = 18.0
-    ball_friction: float = 0.92
+
+    # --- Variable pass speed ---
+    pass_speed_min: float = 7.0
+    pass_speed_max: float = 17.0
+    pass_speed_distance_per_m: float = 0.4
+    pass_speed_type_through_bonus: float = 2.0
+    pass_speed_type_lead_bonus: float = 1.0
+    pass_speed_pressure_malus: float = 2.5
+
+    # --- Dynamic lead time ---
+    lead_time_min: float = 0.25
+    lead_time_flight_fraction: float = 0.85
+    lead_time_receiver_speed_factor: float = 0.06
+    lead_time_through_extra: float = 0.4
+    lead_defender_nudge_radius: float = 2.8
+    lead_defender_nudge_strength: float = 1.2
+
+    # --- Pass error model ---
+    pass_error_base: float = 0.12
+    pass_error_quality_factor: float = 0.85
+    pass_error_distance_per_m: float = 0.014
+    pass_error_speed_factor: float = 0.03
+    pass_error_facing_factor: float = 0.4
+    ball_deceleration: float = 3.8  # m/s², uniform deceleration for ground passes
+    lead_prediction_quality_factor: float = 0.5  # how much attack_awareness affects lead time accuracy
+    # --- Open-space search ---
+    open_space_radius: float = 5.0
+    open_space_samples: int = 14
+    open_space_defender_weight: float = 3.0
+    # --- Dribbling ---
+    dribble_forward_bias: float = 1.5
+    # --- Off-ball support ---
+    support_lane_weight: float = 1.5
+    # --- Defending ---
+    mark_intercept_ratio: float = 0.4
+
     dribble_push: float = 1.1
     support_distance: float = 8.0
     shot_range: float = 13.0

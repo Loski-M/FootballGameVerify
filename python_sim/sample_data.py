@@ -65,8 +65,8 @@ def build_sample_match(config: MatchConfig) -> MatchState:
     team_b_players = [
         build_player("B_GK", "B", "B_GK", Role.GK, PlayerAttributes(52, 28, 34, 46, 50, 43, 68, 75, 82), right_x - 3, half_h),
         build_player("B_AN", "B", "B_Anchor", Role.ANCHOR, PlayerAttributes(73, 55, 64, 61, 62, 68, 78, 79), right_x - 9, half_h),
-        build_player("B_L", "B", "B_Left", Role.LEFT, PlayerAttributes(69, 67, 72, 79, 78, 70, 63, 74), right_x - 13, half_h - 5),
-        build_player("B_R", "B", "B_Right", Role.RIGHT, PlayerAttributes(71, 69, 71, 78, 76, 72, 64, 74), right_x - 13, half_h + 5),
+        build_player("B_L", "B", "B_Left", Role.LEFT, PlayerAttributes(69, 67, 72, 79, 78, 70, 63, 74), right_x - 13, half_h + 5),
+        build_player("B_R", "B", "B_Right", Role.RIGHT, PlayerAttributes(71, 69, 71, 78, 76, 72, 64, 74), right_x - 13, half_h - 5),
         build_player("B_P", "B", "B_Pivot", Role.PIVOT, PlayerAttributes(65, 84, 70, 70, 66, 81, 53, 71), right_x - 18, half_h),
     ]
 
