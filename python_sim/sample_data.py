@@ -96,17 +96,22 @@ def build_sample_match(config: MatchConfig) -> MatchState:
         player.state.facing_angle = 3.141592653589793
         player.state.target_facing_angle = 3.141592653589793
     ball = BallState(
-        x=kickoff.state.x,
-        y=kickoff.state.y,
-        owner_team_id="A",
-        owner_player_id=kickoff.player_id,
-        last_touch_team_id="A",
-        last_touch_player_id=kickoff.player_id,
+        x=config.pitch_width / 2,
+        y=half_h,
+        owner_team_id=None,
+        owner_player_id=None,
+        last_touch_team_id=None,
+        last_touch_player_id=None,
         last_touch_action=None,
     )
 
-    return MatchState(
+    match = MatchState(
         teams=[team_a, team_b],
         ball=ball,
         stats={"A": TeamStats(), "B": TeamStats()},
+        dead_ball=True,
+        restart_team_id="A",
+        restart_reason="Kickoff",
     )
+    
+    return match

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from .models import Role
 import random
 
 from python_sim.ai import angle_to, clamp, decide_all_players, distance, get_owner_player, normalize_angle, update_team_phase
@@ -88,6 +89,7 @@ class MatchSimulator:
         match.ball.last_touch_team_id = owner.team_id
         match.ball.last_touch_player_id = owner.player_id
         match.ball.last_touch_action = PlayerAction.DRIBBLE
+        match.restart_reason = ""
         self._maybe_tackle_owner(match, owner)
 
     def _execute_pass(self, match: MatchState, owner: Player, target_player_id: str) -> None:
@@ -116,18 +118,26 @@ class MatchSimulator:
         match.ball.last_touch_team_id = owner.team_id
         match.ball.last_touch_player_id = owner.player_id
         match.ball.last_touch_action = PlayerAction.PASS
+        match.restart_reason = ""
         pass_suffix = f" ({owner.state.intent.pass_type.value})" if owner.state.intent.pass_type else ""
         self._log(match, f"{owner.name} attempts a pass to {target.name}{pass_suffix}")
 
     def _execute_shot(self, match: MatchState, owner: Player) -> None:
         team_stats = match.stats[owner.team_id]
         team_stats.shots += 1
+        
+        # Determine target corner (far post relative to owner's y)
         goal_x = self.config.pitch_width if self._team_by_id(match, owner.team_id).attack_direction == 1 else 0.0
-        desired_angle = angle_to(owner.state.x, owner.state.y, goal_x, self.config.pitch_height / 2)
+        half_h = self.config.pitch_height / 2
+        aim_y = half_h + self.config.goal_width / 2 - 0.5 if owner.state.y < half_h else half_h - self.config.goal_width / 2 + 0.5
+        
+        desired_angle = angle_to(owner.state.x, owner.state.y, goal_x, aim_y)
         facing_gap = abs(normalize_angle(desired_angle - owner.state.facing_angle)) / math.pi
-        goal_y = self.config.pitch_height / 2 + self.rng.uniform(-1.5, 1.5) * (
-            max(0.15, 1.0 - owner.derived.shot_quality / 100.0) + facing_gap * 0.7
-        )
+        
+        # Calculate error margin based on quality and facing
+        error_margin = (max(0.15, 1.0 - owner.derived.shot_quality / 100.0) + facing_gap * 0.7) * 3.0
+        goal_y = aim_y + self.rng.uniform(-error_margin, error_margin)
+        
         dx = goal_x - owner.state.x
         dy = goal_y - owner.state.y
         dist = math.hypot(dx, dy) or 1.0
@@ -140,6 +150,7 @@ class MatchSimulator:
         match.ball.last_touch_team_id = owner.team_id
         match.ball.last_touch_player_id = owner.player_id
         match.ball.last_touch_action = PlayerAction.SHOOT
+        match.restart_reason = ""
         self._log(match, f"{owner.name} shoots")
 
     def _move_off_ball_players(self, match: MatchState) -> None:
@@ -272,29 +283,25 @@ class MatchSimulator:
     def _reset_after_goal(self, match: MatchState, kickoff_team_id: str) -> None:
         half_h = self.config.pitch_height / 2
         for team in match.teams:
-            sign = 1 if team.team_id == "A" else -1
-            base_x = 10 if sign == 1 else self.config.pitch_width - 10
-            for idx, player in enumerate(team.players):
+            for player in team.players:
                 player.state.has_ball = False
+                # Do NOT forcibly teleport them into a diagonal line. Let them run back to own half.
                 player.state.decision_cooldown = 0.0
-                player.state.y = clamp(half_h + (idx - 2) * 3.0, 2.0, self.config.pitch_height - 2.0)
-                player.state.x = clamp(base_x + sign * min(idx * 2.0, 8.0), 2.0, self.config.pitch_width - 2.0)
-        kickoff_player = self._team_by_id(match, kickoff_team_id).players[1]
-        kickoff_player.state.x = self.config.pitch_width / 2
-        kickoff_player.state.y = half_h
-        kickoff_player.state.has_ball = True
-        kickoff_player.state.target_facing_angle = angle_to(kickoff_player.state.x, kickoff_player.state.y, self._opponent_goal_x(match, kickoff_team_id), half_h)
+                player.state.intercept_x = None
+                player.state.intercept_y = None
+                player.state.intercept_locked_until = 0.0
+
         match.ball = BallState(
-            x=kickoff_player.state.x,
-            y=kickoff_player.state.y,
-            owner_team_id=kickoff_team_id,
-            owner_player_id=kickoff_player.player_id,
-            last_touch_team_id=kickoff_team_id,
-            last_touch_player_id=kickoff_player.player_id,
+            x=self.config.pitch_width / 2,
+            y=half_h,
+            owner_team_id=None,
+            owner_player_id=None,
+            last_touch_team_id=None,
+            last_touch_player_id=None,
         )
-        match.dead_ball = False
-        match.restart_team_id = None
-        match.restart_reason = ""
+        match.dead_ball = True
+        match.restart_team_id = kickoff_team_id
+        match.restart_reason = "Kickoff"
         self._team_by_id(match, kickoff_team_id).state.last_gain_time = match.time_seconds
 
     def _update_stamina(self, match: MatchState) -> None:
@@ -359,8 +366,24 @@ class MatchSimulator:
 
     def _handle_restart(self, match: MatchState) -> None:
         self._move_off_ball_players(match)
+        
+        # If it's a kickoff and ball has no owner, give it to a player near the center
+        if match.restart_reason == "Kickoff" and match.ball.owner_player_id is None and match.restart_team_id:
+            team = self._team_by_id(match, match.restart_team_id)
+            # Find closest player (except GK)
+            candidates = sorted([p for p in team.players if p.role != Role.GK], key=lambda p: distance(p.state.x, p.state.y, match.ball.x, match.ball.y))
+            taker = candidates[0]
+            taker.state.x = match.ball.x - 0.5 if team.attack_direction == 1 else match.ball.x + 0.5
+            taker.state.y = match.ball.y
+            taker.state.has_ball = True
+            taker.state.decision_cooldown = 10.0
+            
+            match.ball.owner_player_id = taker.player_id
+            match.ball.owner_team_id = taker.team_id
+            
         if match.ball.owner_player_id is None:
             return
+            
         taker = self._find_player(match, match.ball.owner_player_id)
         if taker is None:
             return
@@ -370,10 +393,10 @@ class MatchSimulator:
         match.ball.vx = 0.0
         match.ball.vy = 0.0
         # Let restart settle for one tick, then resume normal play.
-        if taker.state.decision_cooldown <= self.config.tick_seconds * 0.5:
+        if taker.state.decision_cooldown <= 0.0:
             match.dead_ball = False
-            match.restart_team_id = None
-            match.restart_reason = ""
+            # We keep restart_reason for one active tick so the AI knows it's a kickoff explicitly
+            # It will clear when a pass/action sets last_touch_action
 
     def _set_throw_in(self, match: MatchState) -> None:
         restart_team = "A" if match.ball.last_touch_team_id == "B" else "B"
@@ -386,18 +409,21 @@ class MatchSimulator:
         goal_max = self.config.pitch_height / 2 + self.config.goal_width / 2
         if goal_min <= match.ball.y <= goal_max:
             return
+            
+        y_corner = 0.5 if match.ball.y < self.config.pitch_height / 2 else self.config.pitch_height - 0.5
+        
         if match.ball.x < 0.0:
             defending_team = "A"
             attacking_team = "B"
             if match.ball.last_touch_team_id == defending_team:
-                self._setup_restart(match, attacking_team, 0.5, clamp(match.ball.y, 2.0, self.config.pitch_height - 2.0), "Corner")
+                self._setup_restart(match, attacking_team, 0.5, y_corner, "Corner")
             else:
                 self._setup_restart(match, defending_team, 3.0, self.config.pitch_height / 2, "GoalKick")
         else:
             defending_team = "B"
             attacking_team = "A"
             if match.ball.last_touch_team_id == defending_team:
-                self._setup_restart(match, attacking_team, self.config.pitch_width - 0.5, clamp(match.ball.y, 2.0, self.config.pitch_height - 2.0), "Corner")
+                self._setup_restart(match, attacking_team, self.config.pitch_width - 0.5, y_corner, "Corner")
             else:
                 self._setup_restart(match, defending_team, self.config.pitch_width - 3.0, self.config.pitch_height / 2, "GoalKick")
 
@@ -416,7 +442,7 @@ class MatchSimulator:
         taker.state.x = x
         taker.state.y = y
         taker.state.has_ball = True
-        taker.state.decision_cooldown = self.config.tick_seconds * 0.5
+        taker.state.decision_cooldown = 10.0 if reason == "Kickoff" else 5.0
         taker.state.target_facing_angle = angle_to(taker.state.x, taker.state.y, self._opponent_goal_x(match, team_id), self.config.pitch_height / 2)
         match.ball.owner_team_id = team_id
         match.ball.owner_player_id = taker.player_id
