@@ -893,6 +893,12 @@ def score_best_pass(
             + receiver_shot_bonus
             + cutback_bonus
         )
+        # Central progression: reward passes from wide to central areas
+        half_h = config.pitch_height / 2
+        passer_lateral = abs(player.state.y - half_h)
+        receiver_lateral = abs(mate.state.y - half_h)
+        if receiver_lateral < passer_lateral - 1.5:
+            score += (passer_lateral - receiver_lateral) * 0.18
         if score > best_score:
             best_score = score
             best_target = mate

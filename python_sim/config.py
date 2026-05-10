@@ -22,11 +22,13 @@ class MatchConfig:
     pass_speed_type_lead_bonus: float = 1.0
     pass_speed_pressure_malus: float = 2.5
 
-    # --- Dynamic lead time ---
-    lead_time_min: float = 0.25
-    lead_time_flight_fraction: float = 0.85
-    lead_time_receiver_speed_factor: float = 0.06
-    lead_time_through_extra: float = 0.4
+    # --- Dynamic lead distance ---
+    # Lead distance = base + receiver_speed * speed_factor + through_extra
+    # This is the DESIGNED "how far ahead" of the receiver the ball should arrive,
+    # replacing the old lead_time_* emergent approach.
+    lead_distance_base: float = 1.5
+    lead_distance_speed_factor: float = 0.35
+    lead_distance_through_extra: float = 3.5
     lead_defender_nudge_radius: float = 2.8
     lead_defender_nudge_strength: float = 1.2
 

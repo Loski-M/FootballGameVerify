@@ -100,9 +100,7 @@ class MatchSimulator:
         team_stats = match.stats[owner.team_id]
         team_stats.passes_attempted += 1
 
-        desired_x, desired_y = self._resolve_pass_target(owner, target, match)
-
-        speed = owner.state.intent.pass_speed if owner.state.intent.pass_speed > 0 else self.config.pass_speed
+        desired_x, desired_y, speed = self._resolve_pass_target(owner, target, match)
 
         desired_angle = angle_to(owner.state.x, owner.state.y, desired_x, desired_y)
         facing_gap = abs(normalize_angle(desired_angle - owner.state.facing_angle)) / math.pi
@@ -715,56 +713,96 @@ class MatchSimulator:
         )
         match.frames.append(frame)
 
-    def _resolve_pass_target(self, owner: Player, target: Player, match: MatchState) -> tuple[float, float]:
+    def _resolve_pass_target(self, owner: Player, target: Player, match: MatchState) -> tuple[float, float, float]:
+        """Returns (target_x, target_y, adjusted_speed).
+
+        Lead distance is DESIGNED first (how far ahead of the receiver the ball
+        should arrive), then pass speed is computed for the actual lead-point
+        distance — fixing the old approach where speed was based on the
+        receiver's *current* position and the lead point was an afterthought.
+        """
         pass_type = owner.state.intent.pass_type
+        intended_speed = owner.state.intent.pass_speed if owner.state.intent.pass_speed > 0 else self.config.pass_speed
+
         if pass_type is None or pass_type == PassType.TO_FEET:
-            return (target.state.x, target.state.y)
+            return (target.state.x, target.state.y, intended_speed)
 
-        ball_speed = owner.state.intent.pass_speed if owner.state.intent.pass_speed > 0 else self.config.pass_speed
-        base_dist = math.hypot(target.state.x - owner.state.x, target.state.y - owner.state.y)
-
-        # Flight time with uniform deceleration: d = v0*t - 0.5*a*t^2
-        a = self.config.ball_deceleration
-        max_reach = ball_speed * ball_speed / (2.0 * a)
-        if base_dist >= max_reach:
-            estimated_flight_time = ball_speed / a  # ball stops at max distance
-        else:
-            estimated_flight_time = (ball_speed - math.sqrt(ball_speed * ball_speed - 2.0 * a * base_dist)) / a
-
+        # 1. Design the lead distance: how far ahead of the receiver
         receiver_speed = math.hypot(target.state.vx, target.state.vy)
-
-        # Prediction quality: passer's attack_awareness affects lead time accuracy
-        pred_quality = owner.attrs.attack_awareness / 100.0
-        receiver_factor = self.config.lead_time_receiver_speed_factor * (0.5 + pred_quality * self.config.lead_prediction_quality_factor)
-
-        lead_time = (
-            self.config.lead_time_min
-            + estimated_flight_time * self.config.lead_time_flight_fraction
-            + receiver_speed * receiver_factor
+        desired_lead = (
+            self.config.lead_distance_base
+            + receiver_speed * self.config.lead_distance_speed_factor
         )
-
         if pass_type == PassType.THROUGH_PASS:
-            lead_time += self.config.lead_time_through_extra
+            desired_lead += self.config.lead_distance_through_extra
 
-        predicted_x = target.state.x + target.state.vx * lead_time
-        predicted_y = target.state.y + target.state.vy * lead_time
+        # 2. Direction: along receiver's velocity, or toward opponent goal if stationary
+        if receiver_speed > 0.5:
+            run_dir_x = target.state.vx / receiver_speed
+            run_dir_y = target.state.vy / receiver_speed
+        else:
+            owner_team = self._team_by_id(match, owner.team_id)
+            run_dir_x = owner_team.attack_direction
+            run_dir_y = 0.0
+
+        # 3. Lead point
+        lead_x = target.state.x + run_dir_x * desired_lead
+        lead_y = target.state.y + run_dir_y * desired_lead
 
         if pass_type == PassType.THROUGH_PASS:
             owner_team = self._team_by_id(match, owner.team_id)
-            forward_offset = owner_team.attack_direction * min(3.5, base_dist * 0.25)
-            predicted_x += forward_offset
+            lead_x += owner_team.attack_direction * 2.0
 
-        # If the predicted lead point is far outside the pitch, fall back to TO_FEET
+        # Out of bounds fallback
         margin = 2.0
-        if (predicted_x < -margin or predicted_x > self.config.pitch_width + margin or
-                predicted_y < -margin or predicted_y > self.config.pitch_height + margin):
-            return (target.state.x, target.state.y)
+        if (lead_x < -margin or lead_x > self.config.pitch_width + margin or
+                lead_y < -margin or lead_y > self.config.pitch_height + margin):
+            return (target.state.x, target.state.y, intended_speed)
 
-        predicted_x, predicted_y = self._nudge_away_from_defenders(match, owner, predicted_x, predicted_y)
+        # 4. Actual distance to the lead point
+        actual_dist = math.hypot(lead_x - owner.state.x, lead_y - owner.state.y)
+
+        # 5. Recalculate ball speed for the ACTUAL lead-point distance
+        speed = self.config.pass_speed_min + actual_dist * self.config.pass_speed_distance_per_m
+        if pass_type == PassType.THROUGH_PASS:
+            speed += self.config.pass_speed_type_through_bonus
+        elif pass_type == PassType.LEAD_PASS:
+            speed += self.config.pass_speed_type_lead_bonus
+
+        quality = owner.derived.pass_quality / 100.0
+        max_speed = self.config.pass_speed_min + (self.config.pass_speed_max - self.config.pass_speed_min) * quality
+        min_reach_speed = math.sqrt(2.0 * self.config.ball_deceleration * actual_dist * 1.05)
+        ball_speed = clamp(speed, max(self.config.pass_speed_min, min_reach_speed), max_speed)
+        ball_speed = max(ball_speed, intended_speed * 0.9)
+
+        # 6. Flight time to lead point
+        a = self.config.ball_deceleration
+        max_reach = ball_speed * ball_speed / (2.0 * a)
+        if actual_dist >= max_reach:
+            flight_time = ball_speed / a
+        else:
+            flight_time = (ball_speed - math.sqrt(ball_speed * ball_speed - 2.0 * a * actual_dist)) / a
+
+        # 7. Timing check: if ball and receiver are badly mismatched, adjust
+        if receiver_speed > 0.5 and flight_time > 0.05:
+            receiver_time_to_lead = desired_lead / receiver_speed
+            if receiver_time_to_lead > flight_time * 2.5:
+                # Ball arrives too early — push lead point further
+                adjusted_lead = receiver_speed * flight_time * 0.85
+                adjusted_lead = clamp(adjusted_lead, desired_lead * 0.5, desired_lead * 2.0)
+                lead_x = target.state.x + run_dir_x * adjusted_lead
+                lead_y = target.state.y + run_dir_y * adjusted_lead
+            elif flight_time > receiver_time_to_lead * 2.5:
+                # Ball too late — fall back to feet
+                return (target.state.x, target.state.y, ball_speed)
+
+        # 8. Nudge away from defenders
+        predicted_x, predicted_y = self._nudge_away_from_defenders(match, owner, lead_x, lead_y)
 
         return (
             clamp(predicted_x, 1.5, self.config.pitch_width - 1.5),
             clamp(predicted_y, 1.5, self.config.pitch_height - 1.5),
+            ball_speed,
         )
 
     def _nudge_away_from_defenders(
