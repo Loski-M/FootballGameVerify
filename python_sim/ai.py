@@ -571,21 +571,50 @@ def structured_target(match: MatchState, team: Team, player: Player, config: Mat
     home_x, home_y = role_home_position(team, player.role, config, attacking=has_ball)
     flank = _role_flank_sign(team, player.role)
     if has_ball:
+        # Tactical style: adjust attacking width and forward push
+        style = team.tactics.style
+        if style == "Control":
+            attack_width = 7.5
+            anchor_behind = 5.5
+            pivot_ahead = 5.0
+        elif style == "Direct":
+            attack_width = 6.0
+            anchor_behind = 4.0
+            pivot_ahead = 6.5
+        else:
+            attack_width = 7.0
+            anchor_behind = 5.0
+            pivot_ahead = 5.5
+
         if player.role == Role.ANCHOR:
             tx, ty = (
-                clamp(ball_x - team.attack_direction * 5.0, 5.0, config.pitch_width - 5.0),
+                clamp(ball_x - team.attack_direction * anchor_behind, 5.0, config.pitch_width - 5.0),
                 clamp((ball_y + half_h) / 2, 3.0, config.pitch_height - 3.0),
             )
         elif player.role in (Role.LEFT, Role.RIGHT):
+            # Weak-side narrowing: if ball is on opposite flank, reduce width
+            lateral = attack_width
+            ball_offset = ball_y - half_h
+            player_side = flank  # +1 or -1
+            if abs(ball_offset) > 4.0 and ball_offset * player_side < 0:
+                lateral = config.weak_side_width
             tx, ty = (
                 clamp(max(home_x, ball_x + team.attack_direction * 1.5), 5.0, config.pitch_width - 5.0),
-                clamp(half_h + flank * 7.0, 2.0, config.pitch_height - 2.0),
+                clamp(half_h + flank * lateral, 2.0, config.pitch_height - 2.0),
             )
         elif player.role == Role.PIVOT:
             tx, ty = (
-                clamp(ball_x + team.attack_direction * 5.5, 6.0, config.pitch_width - 6.0),
+                clamp(ball_x + team.attack_direction * pivot_ahead, 6.0, config.pitch_width - 6.0),
                 clamp(half_h + (ball_y - half_h) * 0.2, 3.0, config.pitch_height - 3.0),
             )
+            # Layer constraint: don't get too far from ANCHOR
+            anchor = next((p for p in team.players if p.role == Role.ANCHOR), None)
+            if anchor:
+                gap_max = config.attack_layer_gap_max
+                if team.attack_direction == 1:
+                    tx = min(tx, anchor.state.x + gap_max)
+                else:
+                    tx = max(tx, anchor.state.x - gap_max)
         else:
             tx, ty = home_x, home_y
             
@@ -649,6 +678,27 @@ def defending_target(
     ball_carrier = owner
     own_goal_x = 0.0 if team.attack_direction == 1 else config.pitch_width
 
+    # Tactical style adjustments
+    style = team.tactics.style
+    if style == "Control":
+        depth_ratio = 0.55
+        block_shift_amount = -3.5 if team.attack_direction == 1 else 3.5
+    elif style == "Direct":
+        depth_ratio = 0.68
+        block_shift_amount = -1.5 if team.attack_direction == 1 else 1.5
+    else:
+        depth_ratio = 0.62
+        block_shift_amount = -2.5 if team.attack_direction == 1 else 2.5
+
+    # Reference point for defensive line alignment: the deepest outfield teammate
+    our_outfield = [p for p in team.players if p.role != Role.GK]
+    deepest_x = None
+    if our_outfield:
+        if team.attack_direction == 1:
+            deepest_x = min(p.state.x for p in our_outfield)
+        else:
+            deepest_x = max(p.state.x for p in our_outfield)
+
     # Counter-attack detection: ball in our half and opponents behind our line → retreat
     midfield_x = config.pitch_width / 2
     ball_in_our_half = (match.ball.x - midfield_x) * team.attack_direction < 0
@@ -700,11 +750,21 @@ def defending_target(
                     tx = max(tx, most_advanced_x + 2.0)
 
         # Depth constraint: don't push too far from own goal
-        max_advance = config.pitch_width * 0.62
+        max_advance = config.pitch_width * depth_ratio
         if team.attack_direction == 1:
             tx = min(tx, max_advance)
         else:
             tx = max(tx, config.pitch_width - max_advance)
+
+        # Defensive line alignment: stay within gap_max of the deepest teammate
+        if deepest_x is not None:
+            gap_max = config.defensive_line_gap_max
+            if team.attack_direction == 1:
+                if tx > deepest_x + gap_max:
+                    tx = deepest_x + gap_max * 0.5
+            else:
+                if tx < deepest_x - gap_max:
+                    tx = deepest_x - gap_max * 0.5
 
         tx = clamp(tx, 2.0, config.pitch_width - 2.0)
         ty = clamp(ty, 2.0, config.pitch_height - 2.0)
@@ -712,16 +772,25 @@ def defending_target(
 
     # Fallback: home position with block shift
     base_x, base_y = role_home_position(team, player.role, config, attacking=False)
-    block_shift = -2.5 if team.attack_direction == 1 else 2.5
+    block_shift = block_shift_amount
     if team.state.phase == TeamPhase.HIGH_PRESS:
         block_shift *= 0.4
     tx = base_x + block_shift
     # Depth constraint on fallback position
-    max_advance = config.pitch_width * 0.62
+    max_advance = config.pitch_width * depth_ratio
     if team.attack_direction == 1:
         tx = min(tx, max_advance)
     else:
         tx = max(tx, config.pitch_width - max_advance)
+    # Defensive line alignment
+    if deepest_x is not None:
+        gap_max = config.defensive_line_gap_max
+        if team.attack_direction == 1:
+            if tx > deepest_x + gap_max:
+                tx = deepest_x + gap_max * 0.5
+        else:
+            if tx < deepest_x - gap_max:
+                tx = deepest_x - gap_max * 0.5
     return (clamp(tx, 3.0, config.pitch_width - 3.0), base_y, PlayerAction.RECOVER)
 
 

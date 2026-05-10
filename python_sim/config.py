@@ -58,3 +58,8 @@ class MatchConfig:
     shot_block_radius: float = 1.2
     fatigue_decay_per_second: float = 0.015
     recovery_decay_per_second: float = 0.006
+
+    # --- Team coherence ---
+    defensive_line_gap_max: float = 8.0     # max longitudinal gap from deepest teammate before pulling back
+    attack_layer_gap_max: float = 12.0      # max distance between PIVOT and ANCHOR
+    weak_side_width: float = 4.0            # lateral offset when ball is on the opposite flank
