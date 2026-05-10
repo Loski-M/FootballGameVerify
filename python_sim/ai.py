@@ -647,6 +647,25 @@ def defending_target(
     # Non-pressing defender: find a dangerous opponent to mark or intercept the passing lane
     opp_team = get_opponent_team(match, team.team_id)
     ball_carrier = owner
+    own_goal_x = 0.0 if team.attack_direction == 1 else config.pitch_width
+
+    # Counter-attack detection: ball in our half and opponents behind our line → retreat
+    midfield_x = config.pitch_width / 2
+    ball_in_our_half = (match.ball.x - midfield_x) * team.attack_direction < 0
+    if ball_in_our_half and ball_carrier:
+        # Check if opponents are behind our deepest outfield player
+        our_outfield = [p for p in team.players if p.role != Role.GK]
+        if our_outfield:
+            if team.attack_direction == 1:
+                deepest_x = min(p.state.x for p in our_outfield)
+                opponents_behind = any(opp.state.x < deepest_x - 1.5 for opp in opp_team.players)
+            else:
+                deepest_x = max(p.state.x for p in our_outfield)
+                opponents_behind = any(opp.state.x > deepest_x + 1.5 for opp in opp_team.players)
+            if opponents_behind:
+                base_x, base_y = role_home_position(team, player.role, config, attacking=False)
+                recovery_x = base_x - team.attack_direction * 3.0
+                return (clamp(recovery_x, 3.0, config.pitch_width - 3.0), base_y, PlayerAction.RECOVER)
 
     # Find the most dangerous opponent (excluding the ball carrier)
     best_danger = -9999.0
@@ -668,7 +687,25 @@ def defending_target(
         ratio = config.mark_intercept_ratio
         tx = ball_carrier.state.x + (mark_target.state.x - ball_carrier.state.x) * ratio
         ty = ball_carrier.state.y + (mark_target.state.y - ball_carrier.state.y) * ratio
-        # Nudge slightly toward the dangerous opponent to close down space
+
+        # ANCHOR: must stay goalside of the most advanced opponent
+        if player.role == Role.ANCHOR:
+            opp_positions = [opp.state.x for opp in opp_team.players if opp.player_id != ball_carrier.player_id]
+            if opp_positions:
+                if team.attack_direction == 1:
+                    most_advanced_x = min(opp_positions)
+                    tx = min(tx, most_advanced_x - 2.0)
+                else:
+                    most_advanced_x = max(opp_positions)
+                    tx = max(tx, most_advanced_x + 2.0)
+
+        # Depth constraint: don't push too far from own goal
+        max_advance = config.pitch_width * 0.62
+        if team.attack_direction == 1:
+            tx = min(tx, max_advance)
+        else:
+            tx = max(tx, config.pitch_width - max_advance)
+
         tx = clamp(tx, 2.0, config.pitch_width - 2.0)
         ty = clamp(ty, 2.0, config.pitch_height - 2.0)
         return (tx, ty, PlayerAction.RECOVER)
@@ -678,7 +715,14 @@ def defending_target(
     block_shift = -2.5 if team.attack_direction == 1 else 2.5
     if team.state.phase == TeamPhase.HIGH_PRESS:
         block_shift *= 0.4
-    return (clamp(base_x + block_shift, 3.0, config.pitch_width - 3.0), base_y, PlayerAction.RECOVER)
+    tx = base_x + block_shift
+    # Depth constraint on fallback position
+    max_advance = config.pitch_width * 0.62
+    if team.attack_direction == 1:
+        tx = min(tx, max_advance)
+    else:
+        tx = max(tx, config.pitch_width - max_advance)
+    return (clamp(tx, 3.0, config.pitch_width - 3.0), base_y, PlayerAction.RECOVER)
 
 
 def score_dribble(match: MatchState, team: Team, player: Player, defender_dist: float, config: MatchConfig) -> float:
@@ -708,11 +752,15 @@ def score_shot(match: MatchState, team: Team, player: Player, defender_dist: flo
         return -5.0
     angle_factor = 1.0 - abs(player.state.y - aim_y) / (config.pitch_height / 2)
     pressure_penalty = max(0.0, (2.5 - defender_dist) * 1.1)
-    close_bonus = 1.2 if dist < config.shot_range * 0.7 else 0.0
+    # Close-range bonus: only significant when angle is decent
+    if dist < config.shot_range * 0.7:
+        close_bonus = 0.5 * max(0.2, angle_factor)
+    else:
+        close_bonus = 0.0
     facing_penalty = abs(normalize_angle(angle_to(player.state.x, player.state.y, goal_x, aim_y) - player.state.facing_angle)) / math.pi
     return (
         player.derived.shot_quality / 20.0
-        + angle_factor * 2.2
+        + angle_factor * 2.8
         + close_bonus
         - dist / config.shot_range
         - pressure_penalty
@@ -755,6 +803,16 @@ def score_best_pass(
             role_bias += 0.5
         facing_penalty = abs(normalize_angle(angle_to(player.state.x, player.state.y, mate.state.x, mate.state.y) - player.state.facing_angle)) / math.pi
         receiver_shot_bonus = _eval_receiver_shot_opportunity(mate, team, config) * 0.5
+        # Cutback bonus: when close to opponent goal at a wide angle,
+        # passing to a more central teammate is a high-quality chance
+        opponent_goal_x = config.pitch_width if team.attack_direction == 1 else 0.0
+        passer_dist_to_goal = abs(opponent_goal_x - owner_x)
+        passer_angle = abs(player.state.y - config.pitch_height / 2)
+        cutback_bonus = 0.0
+        if passer_dist_to_goal < 7.0 and passer_angle > 4.5:
+            mate_angle = abs(mate.state.y - config.pitch_height / 2)
+            if mate_angle < passer_angle - 1.0:
+                cutback_bonus = (passer_angle - mate_angle) * 0.25
         score = (
             player.derived.pass_quality / 26.0
             + forward_value * 0.3
@@ -764,6 +822,7 @@ def score_best_pass(
             - facing_penalty * 0.9
             - lane_penalty
             + receiver_shot_bonus
+            + cutback_bonus
         )
         if score > best_score:
             best_score = score
