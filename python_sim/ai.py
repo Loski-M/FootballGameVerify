@@ -170,10 +170,15 @@ def choose_dribble_target(
 ) -> tuple[float, float]:
     """Sample positions in a forward arc and pick the one with best balance of
     forward progress, open space, and defender avoidance.
-    When close to goal, bias strongly toward goal instead of dodging defenders."""
+    When close to goal, bias strongly toward goal instead of dodging defenders.
+    The goalkeeper is NOT treated as a defender to dodge — the response to a GK
+    should be to shoot, not to dribble around them."""
     px, py = player.state.x, player.state.y
     goal_x = config.pitch_width if team.attack_direction == 1 else 0.0
     dist_to_goal = abs(goal_x - px)
+
+    # Exclude GK from defender avoidance — don't dodge the keeper
+    outfield_opponents = [o for o in opponents if o.role != Role.GK]
 
     # In shooting range: prioritise driving toward goal, not dodging defenders
     if dist_to_goal < config.shot_range:
@@ -190,6 +195,10 @@ def choose_dribble_target(
     radii = [config.open_space_radius / 3, config.open_space_radius * 2 / 3, config.open_space_radius]
     n_angles = max(4, config.open_space_samples // len(radii))
 
+    # Player's lateral position relative to centre (for centre bias)
+    half_h = config.pitch_height / 2
+    player_y_centre_dist = abs(py - half_h)
+
     best_x, best_y = px, py
     best_score = -9999.0
 
@@ -204,13 +213,21 @@ def choose_dribble_target(
             # Forward progress
             forward = (cx - px) * team.attack_direction * fwd_bias
 
-            # Defender avoidance (faded near goal)
-            min_def_dist = min((distance(cx, cy, o.state.x, o.state.y) for o in opponents), default=99.0)
+            # Defender avoidance (GK excluded; faded near goal)
+            min_def_dist = min((distance(cx, cy, o.state.x, o.state.y) for o in outfield_opponents), default=99.0)
             defender_score = min(min_def_dist, 5.0) * def_weight
 
-            # Sideline penalty
+            # Sideline penalty — worse when closer to goal (don't go to the corner)
             sideline_dist = min(cy, config.pitch_height - cy, cx, config.pitch_width - cx)
             sideline_penalty = -max(0.0, 2.0 - sideline_dist) * 2.0
+            if dist_to_goal < config.shot_range:
+                sideline_penalty *= (1.0 + goal_proximity * 2.5)
+
+            # Centre bias: when wide in attacking third, reward moving toward centre
+            centre_bias = 0.0
+            if dist_to_goal < config.shot_range and player_y_centre_dist > config.pitch_height * 0.3:
+                candidate_y_centre_dist = abs(cy - half_h)
+                centre_bias = (player_y_centre_dist - candidate_y_centre_dist) * 0.5
 
             # Don't wander too far in one tick
             dist_penalty = -distance(px, py, cx, cy) * 0.2
@@ -224,7 +241,7 @@ def choose_dribble_target(
                 if d < 1.5:
                     teammate_penalty -= (1.5 - d) * 1.5
 
-            score = forward + defender_score + sideline_penalty + dist_penalty + teammate_penalty
+            score = forward + defender_score + sideline_penalty + centre_bias + dist_penalty + teammate_penalty
             if score > best_score:
                 best_score = score
                 best_x, best_y = cx, cy
@@ -352,6 +369,9 @@ def choose_pass_type(team: Team, player: Player, target: Player, nearest_defende
         and team.state.phase == TeamPhase.POSSESSION_ATTACK
     ):
         return PassType.THROUGH_PASS
+    # Short passes always go to feet — no lead time needed and error is lower
+    if dist <= 6.0:
+        return PassType.TO_FEET
     if forward_value > 2.0 or lateral_gap > 4.0 or dist > 10.0:
         return PassType.LEAD_PASS
     return PassType.TO_FEET
@@ -672,6 +692,9 @@ def score_dribble(match: MatchState, team: Team, player: Player, defender_dist: 
     forward_bonus = 1.5 - dist_to_goal / config.pitch_width
     pressure_penalty = max(0.0, (3.2 - defender_dist) * 1.0)
     sideline_penalty = abs(player.state.y - config.pitch_height / 2) / config.pitch_height
+    # Being near the sideline is worse when close to goal (tight angle)
+    if dist_to_goal < config.shot_range:
+        sideline_penalty *= (1.0 + (1.0 - dist_to_goal / config.shot_range) * 2.0)
     body_alignment = 1.0 - abs(normalize_angle(angle_to(player.state.x, player.state.y, player.state.intent.target_x, player.state.intent.target_y) - player.state.facing_angle)) / math.pi
     return player.derived.ball_control / 35.0 + forward_bonus - pressure_penalty - sideline_penalty + body_alignment * 0.4
 
@@ -731,6 +754,7 @@ def score_best_pass(
         if mate.role == Role.PIVOT:
             role_bias += 0.5
         facing_penalty = abs(normalize_angle(angle_to(player.state.x, player.state.y, mate.state.x, mate.state.y) - player.state.facing_angle)) / math.pi
+        receiver_shot_bonus = _eval_receiver_shot_opportunity(mate, team, config) * 0.5
         score = (
             player.derived.pass_quality / 26.0
             + forward_value * 0.3
@@ -739,6 +763,7 @@ def score_best_pass(
             + role_bias
             - facing_penalty * 0.9
             - lane_penalty
+            + receiver_shot_bonus
         )
         if score > best_score:
             best_score = score
@@ -765,3 +790,31 @@ def nearest_opponent(match: MatchState, player: Player) -> Player | None:
                 best = d
                 nearest = opponent
     return nearest
+
+
+def _eval_receiver_shot_opportunity(player: Player, team: Team, config: MatchConfig) -> float:
+    """Evaluate how good a shot opportunity the player has from their current position.
+    Returns a score based on distance to goal, angle quality, and shooting ability."""
+    goal_x = config.pitch_width if team.attack_direction == 1 else 0.0
+    half_h = config.pitch_height / 2
+    dist_to_goal = abs(goal_x - player.state.x)
+
+    if dist_to_goal > config.shot_range * 1.35:
+        return 0.0
+
+    # Angle quality: how central is the player relative to the goal centre?
+    angle_to_center = abs(player.state.y - half_h)
+    max_angle_offset = config.goal_width / 2
+    angle_quality = max(0.0, 1.0 - angle_to_center / max(max_angle_offset * 2.0, 0.5))
+
+    # Distance quality: closer is better
+    distance_quality = max(0.0, 1.0 - dist_to_goal / config.shot_range)
+
+    # Shooting ability
+    shot_ability = player.derived.shot_quality / 100.0
+
+    return (
+        distance_quality * 1.5
+        + angle_quality * 2.0
+        + shot_ability * 0.8
+    )

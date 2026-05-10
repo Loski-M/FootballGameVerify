@@ -114,9 +114,11 @@ class MatchSimulator:
             0.0, 1.0,
         )
 
+        # Quality error scales down for short passes — close passes are easier
+        quality_distance_scale = min(1.0, dist_m / 8.0)
         error_std = (
             self.config.pass_error_base
-            + (1.0 - quality) * self.config.pass_error_quality_factor
+            + (1.0 - quality) * self.config.pass_error_quality_factor * quality_distance_scale
             + dist_m * self.config.pass_error_distance_per_m
             + speed_factor * self.config.pass_error_speed_factor
             + facing_gap * self.config.pass_error_facing_factor
@@ -156,19 +158,57 @@ class MatchSimulator:
     def _execute_shot(self, match: MatchState, owner: Player) -> None:
         team_stats = match.stats[owner.team_id]
         team_stats.shots += 1
-        
-        # Determine target corner (far post relative to owner's y)
-        goal_x = self.config.pitch_width if self._team_by_id(match, owner.team_id).attack_direction == 1 else 0.0
-        half_h = self.config.pitch_height / 2
-        aim_y = half_h + self.config.goal_width / 2 - 0.5 if owner.state.y < half_h else half_h - self.config.goal_width / 2 + 0.5
-        
+
+        # Determine goal x and defending goalkeeper
+        attacking_team = self._team_by_id(match, owner.team_id)
+        goal_x = self.config.pitch_width if attacking_team.attack_direction == 1 else 0.0
+
+        defending_team_id = "A" if owner.team_id == "B" else "B"
+        defending_team = self._team_by_id(match, defending_team_id)
+        keeper = next(player for player in defending_team.players if player.role.name == "GK")
+        keeper_y = keeper.state.y
+
+        # Determine aim point: aim away from the side the GK is covering
+        goal_min = self.config.pitch_height / 2 - self.config.goal_width / 2
+        goal_max = self.config.pitch_height / 2 + self.config.goal_width / 2
+        mid_goal = self.config.pitch_height / 2
+
+        gk_offset = keeper_y - mid_goal
+        dead_zone = self.config.goal_width * 0.15
+        if abs(gk_offset) < dead_zone:
+            # GK centered: fall back to far-post logic based on shooter position
+            aim_y = goal_max - 0.5 if owner.state.y < mid_goal else goal_min + 0.5
+        elif gk_offset > 0:
+            # GK covering upper side, aim lower
+            aim_y = goal_min + 0.5
+        else:
+            # GK covering lower side, aim upper
+            aim_y = goal_max - 0.5
+
         desired_angle = angle_to(owner.state.x, owner.state.y, goal_x, aim_y)
         facing_gap = abs(normalize_angle(desired_angle - owner.state.facing_angle)) / math.pi
-        
-        # Calculate error margin based on quality and facing
-        error_margin = (max(0.15, 1.0 - owner.derived.shot_quality / 100.0) + facing_gap * 0.7) * 3.0
+
+        # Variable shot speed based on shooting ability
+        shot_ability = owner.derived.shot_quality / 100.0
+        shot_speed = self.config.shot_speed * (0.75 + 0.25 * shot_ability)
+
+        # Error margin depends on shot quality, facing, distance, and difficulty
+        dist_to_goal = abs(goal_x - owner.state.x)
+        dist_factor = dist_to_goal / max(1.0, self.config.shot_range)
+        angle_from_gk = abs(aim_y - keeper_y) / max(0.5, self.config.goal_width / 2)
+        speed_ratio = shot_speed / self.config.shot_speed
+        shot_difficulty = (
+            1.0
+            + max(0.0, speed_ratio - 1.0) * 1.2
+            + dist_factor * 0.8
+            + min(angle_from_gk, 1.5) * 0.15
+        )
+        error_margin = (
+            max(0.15, 1.0 - shot_ability) + facing_gap * 0.7
+        ) * 3.0 * shot_difficulty
+
         goal_y = aim_y + self.rng.uniform(-error_margin, error_margin)
-        
+
         dx = goal_x - owner.state.x
         dy = goal_y - owner.state.y
         dist = math.hypot(dx, dy) or 1.0
@@ -176,13 +216,27 @@ class MatchSimulator:
         match.ball.owner_team_id = None
         owner.state.has_ball = False
         owner.state.target_facing_angle = angle_to(owner.state.x, owner.state.y, goal_x, goal_y)
-        match.ball.vx = dx / dist * self.config.shot_speed
-        match.ball.vy = dy / dist * self.config.shot_speed
+        match.ball.vx = dx / dist * shot_speed
+        match.ball.vy = dy / dist * shot_speed
         match.ball.last_touch_team_id = owner.team_id
         match.ball.last_touch_player_id = owner.player_id
         match.ball.last_touch_action = PlayerAction.SHOOT
         match.restart_reason = ""
         self._log(match, f"{owner.name} shoots")
+
+    def _project_ball_to_goal_line(self, match: MatchState, goal_x: float) -> tuple[float, float]:
+        bx, by = match.ball.x, match.ball.y
+        vx, vy = match.ball.vx, match.ball.vy
+
+        if abs(vx) < 0.01:
+            return (by, 999.0)
+
+        time_to_goal = (goal_x - bx) / vx
+        if time_to_goal <= 0.0:
+            return (by, 999.0)
+
+        cross_y = by + vy * time_to_goal
+        return (cross_y, time_to_goal)
 
     def _move_off_ball_players(self, match: MatchState) -> None:
         owner = get_owner_player(match)
@@ -305,12 +359,70 @@ class MatchSimulator:
     def _check_goal(self, match: MatchState) -> str | None:
         goal_min = self.config.pitch_height / 2 - self.config.goal_width / 2
         goal_max = self.config.pitch_height / 2 + self.config.goal_width / 2
-        if goal_min <= match.ball.y <= goal_max:
-            if match.ball.x <= 0.0:
-                return "B"
-            if match.ball.x >= self.config.pitch_width:
-                return "A"
-        return None
+
+        if not (goal_min <= match.ball.y <= goal_max):
+            return None
+
+        # Determine which goal is being attacked
+        if match.ball.x <= 0.0:
+            scoring_team = "B"
+        elif match.ball.x >= self.config.pitch_width:
+            scoring_team = "A"
+        else:
+            return None
+
+        # Post check: ball within 0.3m of goal edge has 20% post-hit chance
+        post_margin = 0.3
+        is_near_post = (
+            abs(match.ball.y - goal_min) <= post_margin
+            or abs(match.ball.y - goal_max) <= post_margin
+        )
+        if is_near_post and self.rng.random() < 0.20:
+            self._handle_post_rebound(match)
+            return None
+
+        # Crossbar check: 10% chance (modelling 3D height in 2D simulation)
+        if self.rng.random() < 0.10:
+            self._handle_crossbar_rebound(match)
+            return None
+
+        return scoring_team
+
+    def _handle_post_rebound(self, match: MatchState) -> None:
+        speed = math.hypot(match.ball.vx, match.ball.vy)
+        rebound_factor = self.rng.uniform(0.7, 0.9)
+        new_speed = speed * rebound_factor
+
+        # Reflect direction (both x and y reverse) with random deflection
+        base_angle = math.atan2(-match.ball.vy, -match.ball.vx)
+        deflection = self.rng.uniform(-0.35, 0.35)
+        new_angle = base_angle + deflection
+
+        match.ball.vx = math.cos(new_angle) * new_speed
+        match.ball.vy = math.sin(new_angle) * new_speed
+        match.ball.owner_player_id = None
+        match.ball.owner_team_id = None
+        match.ball.last_touch_action = None
+        self._clear_pass_intent(match)
+        self._log(match, "Shot hits the post!")
+
+    def _handle_crossbar_rebound(self, match: MatchState) -> None:
+        speed = math.hypot(match.ball.vx, match.ball.vy)
+        rebound_factor = self.rng.uniform(0.7, 0.9)
+        new_speed = speed * rebound_factor
+
+        # Reflect with wider random spread (crossbar produces unpredictable bounces)
+        base_angle = math.atan2(-match.ball.vy, -match.ball.vx)
+        deflection = self.rng.uniform(-0.6, 0.6)
+        new_angle = base_angle + deflection
+
+        match.ball.vx = math.cos(new_angle) * new_speed
+        match.ball.vy = math.sin(new_angle) * new_speed
+        match.ball.owner_player_id = None
+        match.ball.owner_team_id = None
+        match.ball.last_touch_action = None
+        self._clear_pass_intent(match)
+        self._log(match, "Shot hits the crossbar!")
 
     def _handle_goal(self, match: MatchState, scoring_team_id: str) -> None:
         self._clear_pass_intent(match)
@@ -392,13 +504,37 @@ class MatchSimulator:
         team = self._team_by_id(match, defending_team_id)
         keeper = next(player for player in team.players if player.role.name == "GK")
         goal_x = 0.0 if defending_team_id == "A" else self.config.pitch_width
-        if abs(match.ball.x - goal_x) > 2.2:
+        if abs(match.ball.x - goal_x) > 2.5:
             return False
-        if abs(match.ball.y - self.config.pitch_height / 2) > self.config.goal_width / 2 + 1.0:
+
+        # Project where the ball will cross the goal line
+        cross_y, time_to_goal = self._project_ball_to_goal_line(match, goal_x)
+
+        # Check if cross point is within or just outside the goal area
+        goal_min = self.config.pitch_height / 2 - self.config.goal_width / 2
+        goal_max = self.config.pitch_height / 2 + self.config.goal_width / 2
+        if cross_y < goal_min - 1.0 or cross_y > goal_max + 1.0:
             return False
-        save_chance = clamp(0.35 + keeper.derived.save_quality / 200.0, 0.35, 0.88)
+
+        # New save formula based on reaction time and angle difficulty
+        shot_speed = math.hypot(match.ball.vx, match.ball.vy)
+        save_quality = keeper.derived.save_quality
+        gk_reach = save_quality / 100.0 * self.config.goal_width / 2
+
+        if gk_reach < 0.01:
+            gk_reach = 0.01
+
+        angle_difficulty = abs(cross_y - keeper.state.y) / gk_reach
+        speed_factor = shot_speed / max(1.0, self.config.shot_speed)
+
+        save_chance = clamp(
+            0.1 + save_quality / 250.0 - angle_difficulty * 0.4 * speed_factor,
+            0.05, 0.85,
+        )
+
         if self.rng.random() > save_chance:
             return False
+
         shooting_team_id = "A" if defending_team_id == "B" else "B"
         match.stats[shooting_team_id].shots_on_target += 1
         match.ball.owner_player_id = keeper.player_id

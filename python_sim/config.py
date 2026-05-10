@@ -15,7 +15,7 @@ class MatchConfig:
     shot_speed: float = 18.0
 
     # --- Variable pass speed ---
-    pass_speed_min: float = 7.0
+    pass_speed_min: float = 5.5
     pass_speed_max: float = 17.0
     pass_speed_distance_per_m: float = 0.4
     pass_speed_type_through_bonus: float = 2.0
