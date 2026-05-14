@@ -45,6 +45,11 @@ class PassType(str, Enum):
     THROUGH_PASS = "through_pass"
 
 
+class BallFlightType(str, Enum):
+    GROUND = "ground"
+    LOFTED = "lofted"
+
+
 @dataclass(slots=True)
 class PlayerAttributes:
     passing: float
@@ -78,6 +83,10 @@ class Intent:
     target_player_id: Optional[str] = None
     pass_type: Optional[PassType] = None
     pass_speed: float = 0.0
+    flight_type: BallFlightType = BallFlightType.GROUND
+    landing_x: float = 0.0
+    landing_y: float = 0.0
+    vertical_speed: float = 0.0
 
 
 @dataclass(slots=True)
@@ -138,6 +147,11 @@ class BallState:
     y: float
     vx: float = 0.0
     vy: float = 0.0
+    z: float = 0.0
+    vz: float = 0.0
+    flight_type: BallFlightType = BallFlightType.GROUND
+    landing_x: float = 0.0
+    landing_y: float = 0.0
     owner_team_id: Optional[str] = None
     owner_player_id: Optional[str] = None
     last_touch_team_id: Optional[str] = None
@@ -185,6 +199,10 @@ class PlayerSnapshot:
 class BallSnapshot:
     x: float
     y: float
+    z: float
+    flight_type: BallFlightType
+    landing_x: float
+    landing_y: float
     owner_team_id: Optional[str]
     owner_player_id: Optional[str]
 

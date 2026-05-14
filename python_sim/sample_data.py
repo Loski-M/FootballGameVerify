@@ -98,6 +98,8 @@ def build_sample_match(config: MatchConfig) -> MatchState:
     ball = BallState(
         x=config.pitch_width / 2,
         y=half_h,
+        landing_x=config.pitch_width / 2,
+        landing_y=half_h,
         owner_team_id=None,
         owner_player_id=None,
         last_touch_team_id=None,

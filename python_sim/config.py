@@ -27,6 +27,12 @@ class MatchConfig:
     pass_dynamic_lane_weight: float = 1.3
     pass_terminal_pressure_weight: float = 0.55
     pass_dribble_safety_margin: float = 0.35
+    lofted_pass_min_distance: float = 12.5
+    lofted_pass_lane_relief: float = 0.55
+    lofted_pass_terminal_pressure_weight: float = 1.8
+    lofted_pass_receiver_space_weight: float = 0.9
+    lofted_pass_decision_bias: float = 1.45
+    lofted_pass_gk_decision_bias: float = 0.7
 
     # --- Dynamic lead distance ---
     # Lead distance = base + receiver_speed * speed_factor + through_extra
@@ -46,6 +52,15 @@ class MatchConfig:
     pass_error_facing_factor: float = 0.4
     ball_deceleration: float = 3.8  # m/s², uniform deceleration for ground passes
     lead_prediction_quality_factor: float = 0.5  # how much attack_awareness affects lead time accuracy
+    gravity: float = 18.0
+    lofted_pass_vertical_speed: float = 7.5
+    lofted_pass_vertical_speed_distance_factor: float = 0.18
+    lofted_pass_landing_speed_factor: float = 0.68
+    ball_control_max_height_outfield: float = 1.2
+    ball_control_max_height_goalkeeper: float = 2.4
+    visual_ball_height_offset_px: float = 10.0
+    visual_ball_height_scale_px_per_m: float = 6.0
+    landing_marker_radius_px: float = 8.0
     # --- Open-space search ---
     open_space_radius: float = 5.0
     open_space_samples: int = 14

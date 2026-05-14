@@ -6,8 +6,9 @@ import random
 
 from python_sim.ai import angle_to, clamp, decide_all_players, distance, get_owner_player, normalize_angle, role_home_position, update_team_phase
 from python_sim.config import MatchConfig
-from python_sim.pass_logic import preview_pass_option
+from python_sim.pass_logic import control_height_for_role, preview_pass_option
 from python_sim.models import (
+    BallFlightType,
     BallSnapshot,
     BallState,
     FrameSnapshot,
@@ -87,6 +88,11 @@ class MatchSimulator:
         match.ball.y = owner.state.y
         match.ball.vx = 0.0
         match.ball.vy = 0.0
+        match.ball.z = 0.0
+        match.ball.vz = 0.0
+        match.ball.flight_type = BallFlightType.GROUND
+        match.ball.landing_x = owner.state.x
+        match.ball.landing_y = owner.state.y
         match.ball.last_touch_team_id = owner.team_id
         match.ball.last_touch_player_id = owner.player_id
         match.ball.last_touch_action = PlayerAction.DRIBBLE
@@ -101,7 +107,7 @@ class MatchSimulator:
         team_stats = match.stats[owner.team_id]
         team_stats.passes_attempted += 1
 
-        desired_x, desired_y, speed = self._resolve_pass_target(owner, target, match)
+        desired_x, desired_y, speed, flight_type, landing_x, landing_y, vertical_speed = self._resolve_pass_target(owner, target, match)
 
         desired_angle = angle_to(owner.state.x, owner.state.y, desired_x, desired_y)
         facing_gap = abs(normalize_angle(desired_angle - owner.state.facing_angle)) / math.pi
@@ -141,6 +147,11 @@ class MatchSimulator:
         owner.state.target_facing_angle = angle_to(owner.state.x, owner.state.y, tx, ty)
         match.ball.vx = dx / dist * speed
         match.ball.vy = dy / dist * speed
+        match.ball.z = 0.0
+        match.ball.vz = vertical_speed if flight_type == BallFlightType.LOFTED else 0.0
+        match.ball.flight_type = flight_type
+        match.ball.landing_x = tx if flight_type == BallFlightType.LOFTED else desired_x
+        match.ball.landing_y = ty if flight_type == BallFlightType.LOFTED else desired_y
         match.ball.last_touch_team_id = owner.team_id
         match.ball.last_touch_player_id = owner.player_id
         match.ball.last_touch_action = PlayerAction.PASS
@@ -148,7 +159,8 @@ class MatchSimulator:
         match.passer_player_id = owner.player_id
         match.receiver_player_id = target_player_id
         pass_suffix = f" ({owner.state.intent.pass_type.value})" if owner.state.intent.pass_type else ""
-        self._log(match, f"{owner.name} attempts a pass to {target.name}{pass_suffix}")
+        flight_suffix = f"/{flight_type.value}" if owner.state.intent.pass_type else ""
+        self._log(match, f"{owner.name} attempts a pass to {target.name}{pass_suffix}{flight_suffix}")
 
     def _clear_pass_intent(self, match: MatchState) -> None:
         match.passer_player_id = None
@@ -217,6 +229,11 @@ class MatchSimulator:
         owner.state.target_facing_angle = angle_to(owner.state.x, owner.state.y, goal_x, goal_y)
         match.ball.vx = dx / dist * shot_speed
         match.ball.vy = dy / dist * shot_speed
+        match.ball.z = 0.0
+        match.ball.vz = 0.0
+        match.ball.flight_type = BallFlightType.GROUND
+        match.ball.landing_x = goal_x
+        match.ball.landing_y = goal_y
         match.ball.last_touch_team_id = owner.team_id
         match.ball.last_touch_player_id = owner.player_id
         match.ball.last_touch_action = PlayerAction.SHOOT
@@ -267,17 +284,30 @@ class MatchSimulator:
             return
         match.ball.x += match.ball.vx * self.config.tick_seconds
         match.ball.y += match.ball.vy * self.config.tick_seconds
-        # Uniform deceleration: reduce speed linearly each tick
-        speed = math.hypot(match.ball.vx, match.ball.vy)
-        if speed > 0.0:
-            decel = self.config.ball_deceleration * self.config.tick_seconds
-            if speed <= decel:
-                match.ball.vx = 0.0
-                match.ball.vy = 0.0
-            else:
-                factor = (speed - decel) / speed
-                match.ball.vx *= factor
-                match.ball.vy *= factor
+        if match.ball.flight_type == BallFlightType.LOFTED or match.ball.z > 0.0 or match.ball.vz > 0.0:
+            match.ball.z += match.ball.vz * self.config.tick_seconds
+            match.ball.vz -= self.config.gravity * self.config.tick_seconds
+            if match.ball.z <= 0.0 and match.ball.vz <= 0.0:
+                match.ball.z = 0.0
+                match.ball.vz = 0.0
+                match.ball.flight_type = BallFlightType.GROUND
+                match.ball.x = match.ball.landing_x
+                match.ball.y = match.ball.landing_y
+                match.ball.vx *= self.config.lofted_pass_landing_speed_factor
+                match.ball.vy *= self.config.lofted_pass_landing_speed_factor
+
+        # Uniform deceleration: reduce speed linearly each tick for ground movement
+        if match.ball.flight_type == BallFlightType.GROUND and match.ball.z <= 0.0:
+            speed = math.hypot(match.ball.vx, match.ball.vy)
+            if speed > 0.0:
+                decel = self.config.ball_deceleration * self.config.tick_seconds
+                if speed <= decel:
+                    match.ball.vx = 0.0
+                    match.ball.vy = 0.0
+                else:
+                    factor = (speed - decel) / speed
+                    match.ball.vx *= factor
+                    match.ball.vy *= factor
 
         if match.ball.y < 0.0 or match.ball.y > self.config.pitch_height:
             self._set_throw_in(match)
@@ -301,6 +331,9 @@ class MatchSimulator:
         candidates: list[tuple[float, Player]] = []
         for team in match.teams:
             for player in team.players:
+                control_height = control_height_for_role(player.role, self.config)
+                if match.ball.z > control_height:
+                    continue
                 d = distance(player.state.x, player.state.y, match.ball.x, match.ball.y)
                 if d <= self.config.ball_control_radius:
                     candidates.append((d - player.derived.ball_control * 0.002, player))
@@ -315,6 +348,11 @@ class MatchSimulator:
         player.state.intercept_x = None
         player.state.intercept_y = None
         player.state.intercept_locked_until = 0.0
+        match.ball.z = 0.0
+        match.ball.vz = 0.0
+        match.ball.flight_type = BallFlightType.GROUND
+        match.ball.landing_x = player.state.x
+        match.ball.landing_y = player.state.y
         for team in match.teams:
             if team.team_id == player.team_id:
                 team.state.last_gain_time = match.time_seconds
@@ -346,6 +384,11 @@ class MatchSimulator:
                 match.ball.y = opponent.state.y
                 match.ball.vx = 0.0
                 match.ball.vy = 0.0
+                match.ball.z = 0.0
+                match.ball.vz = 0.0
+                match.ball.flight_type = BallFlightType.GROUND
+                match.ball.landing_x = opponent.state.x
+                match.ball.landing_y = opponent.state.y
                 match.ball.last_touch_team_id = opponent.team_id
                 match.ball.last_touch_player_id = opponent.player_id
                 match.ball.last_touch_action = None
@@ -399,6 +442,11 @@ class MatchSimulator:
 
         match.ball.vx = math.cos(new_angle) * new_speed
         match.ball.vy = math.sin(new_angle) * new_speed
+        match.ball.z = 0.0
+        match.ball.vz = 0.0
+        match.ball.flight_type = BallFlightType.GROUND
+        match.ball.landing_x = match.ball.x
+        match.ball.landing_y = match.ball.y
         match.ball.owner_player_id = None
         match.ball.owner_team_id = None
         match.ball.last_touch_action = None
@@ -417,6 +465,11 @@ class MatchSimulator:
 
         match.ball.vx = math.cos(new_angle) * new_speed
         match.ball.vy = math.sin(new_angle) * new_speed
+        match.ball.z = 0.0
+        match.ball.vz = 0.0
+        match.ball.flight_type = BallFlightType.GROUND
+        match.ball.landing_x = match.ball.x
+        match.ball.landing_y = match.ball.y
         match.ball.owner_player_id = None
         match.ball.owner_team_id = None
         match.ball.last_touch_action = None
@@ -456,6 +509,11 @@ class MatchSimulator:
         match.ball = BallState(
             x=self.config.pitch_width / 2,
             y=half_h,
+            z=0.0,
+            vz=0.0,
+            flight_type=BallFlightType.GROUND,
+            landing_x=self.config.pitch_width / 2,
+            landing_y=half_h,
             owner_team_id=None,
             owner_player_id=None,
             last_touch_team_id=None,
@@ -543,6 +601,11 @@ class MatchSimulator:
         match.ball.y = keeper.state.y
         match.ball.vx = 0.0
         match.ball.vy = 0.0
+        match.ball.z = 0.0
+        match.ball.vz = 0.0
+        match.ball.flight_type = BallFlightType.GROUND
+        match.ball.landing_x = keeper.state.x
+        match.ball.landing_y = keeper.state.y
         match.ball.last_touch_team_id = keeper.team_id
         match.ball.last_touch_player_id = keeper.player_id
         match.ball.last_touch_action = None
@@ -579,6 +642,11 @@ class MatchSimulator:
         match.ball.y = taker.state.y
         match.ball.vx = 0.0
         match.ball.vy = 0.0
+        match.ball.z = 0.0
+        match.ball.vz = 0.0
+        match.ball.flight_type = BallFlightType.GROUND
+        match.ball.landing_x = taker.state.x
+        match.ball.landing_y = taker.state.y
         # Let restart settle for one tick, then resume normal play.
         if taker.state.decision_cooldown <= 0.0:
             match.dead_ball = False
@@ -638,6 +706,11 @@ class MatchSimulator:
         match.ball.y = y
         match.ball.vx = 0.0
         match.ball.vy = 0.0
+        match.ball.z = 0.0
+        match.ball.vz = 0.0
+        match.ball.flight_type = BallFlightType.GROUND
+        match.ball.landing_x = x
+        match.ball.landing_y = y
         match.ball.last_touch_action = None
         self._team_by_id(match, team_id).state.last_gain_time = match.time_seconds
         self._log(match, f"{reason} for {self._team_by_id(match, team_id).name}")
@@ -682,6 +755,10 @@ class MatchSimulator:
             ball=BallSnapshot(
                 x=match.ball.x,
                 y=match.ball.y,
+                z=match.ball.z,
+                flight_type=match.ball.flight_type,
+                landing_x=match.ball.landing_x,
+                landing_y=match.ball.landing_y,
                 owner_team_id=match.ball.owner_team_id,
                 owner_player_id=match.ball.owner_player_id,
             ),
@@ -714,15 +791,33 @@ class MatchSimulator:
         )
         match.frames.append(frame)
 
-    def _resolve_pass_target(self, owner: Player, target: Player, match: MatchState) -> tuple[float, float, float]:
-        """Returns (target_x, target_y, speed), preferring the cached preview in Intent."""
+    def _resolve_pass_target(
+        self, owner: Player, target: Player, match: MatchState
+    ) -> tuple[float, float, float, BallFlightType, float, float, float]:
+        """Returns target/speed/flight data, preferring the cached preview in Intent."""
         intent = owner.state.intent
         if intent.pass_speed > 0.0:
-            return (intent.target_x, intent.target_y, intent.pass_speed)
+            return (
+                intent.target_x,
+                intent.target_y,
+                intent.pass_speed,
+                intent.flight_type,
+                intent.landing_x,
+                intent.landing_y,
+                intent.vertical_speed,
+            )
 
         owner_team = self._team_by_id(match, owner.team_id)
         preview = preview_pass_option(match, owner_team, owner, target, self.config)
-        return (preview.target_x, preview.target_y, preview.ball_speed)
+        return (
+            preview.target_x,
+            preview.target_y,
+            preview.ball_speed,
+            preview.flight_type,
+            preview.landing_x,
+            preview.landing_y,
+            preview.vertical_speed,
+        )
 
     def _nudge_away_from_defenders(
         self, match: MatchState, owner: Player, target_x: float, target_y: float

@@ -100,7 +100,37 @@ class MatchReplayViewer:
         self.canvas.delete("dynamic")
 
         bx, by = self.world_to_canvas(frame.ball.x, frame.ball.y)
-        self.canvas.create_oval(bx - 4, by - 4, bx + 4, by + 4, fill="#ffd54a", outline="black", tags="dynamic")
+        if frame.ball.flight_type.value == "lofted" or frame.ball.z > 0.05:
+            lx, ly = self.world_to_canvas(frame.ball.landing_x, frame.ball.landing_y)
+            r = self.config.landing_marker_radius_px
+            self.canvas.create_oval(
+                lx - r,
+                ly - r,
+                lx + r,
+                ly + r,
+                outline="#ffcc80",
+                dash=(3, 3),
+                width=2,
+                tags="dynamic",
+            )
+
+        self.canvas.create_oval(bx - 4, by - 4, bx + 4, by + 4, fill="#37474f", outline="", tags="dynamic")
+        height_offset = self.config.visual_ball_height_offset_px + frame.ball.z * self.config.visual_ball_height_scale_px_per_m
+        ball_draw_y = by - height_offset if frame.ball.z > 0.05 else by
+        ball_radius = 4 + min(2.0, frame.ball.z * 0.35)
+        ball_outline = "#ffffff" if frame.ball.flight_type.value == "lofted" or frame.ball.z > 0.05 else "black"
+        self.canvas.create_oval(
+            bx - ball_radius,
+            ball_draw_y - ball_radius,
+            bx + ball_radius,
+            ball_draw_y + ball_radius,
+            fill="#ffd54a",
+            outline=ball_outline,
+            width=2 if ball_outline == "#ffffff" else 1,
+            tags="dynamic",
+        )
+        if frame.ball.z > 0.05:
+            self.canvas.create_line(bx, by, bx, ball_draw_y, fill="#ffecb3", dash=(2, 2), tags="dynamic")
 
         for player in frame.players:
             px, py = self.world_to_canvas(player.x, player.y)
@@ -130,6 +160,9 @@ class MatchReplayViewer:
         self.info_var.set(
             f"time: {frame.time_seconds:5.1f}s\n"
             f"ball owner: {owner}\n"
+            f"ball height: {frame.ball.z:4.2f}m\n"
+            f"flight type: {frame.ball.flight_type.value}\n"
+            f"landing: ({frame.ball.landing_x:4.1f}, {frame.ball.landing_y:4.1f})\n"
             f"phases: {team_info}"
         )
         self.event_var.set(frame.latest_event or "(no event)")

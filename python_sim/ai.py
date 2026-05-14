@@ -4,8 +4,9 @@ import math
 import random
 
 from python_sim.config import MatchConfig
-from python_sim.pass_logic import PassPreview, preview_pass_option
+from python_sim.pass_logic import PassPreview, control_height_for_role, preview_pass_option, time_until_height
 from python_sim.models import (
+    BallFlightType,
     Intent,
     MatchState,
     Player,
@@ -363,8 +364,30 @@ def choose_intercept_point(match: MatchState, player: Player, config: MatchConfi
             return None
     if player.state.intercept_x is not None and match.time_seconds < player.state.intercept_locked_until:
         return (player.state.intercept_x, player.state.intercept_y, player.state.receive_mode)
-    if abs(match.ball.vx) + abs(match.ball.vy) < 0.6:
+    if abs(match.ball.vx) + abs(match.ball.vy) < 0.6 and match.ball.z <= 0.05:
         return None
+    control_height = control_height_for_role(player.role, config)
+    if match.ball.flight_type == BallFlightType.LOFTED and (match.ball.z > control_height or match.ball.vz > 0.0):
+        playable_time = time_until_height(match.ball.z, match.ball.vz, control_height, config.gravity)
+        if playable_time is None:
+            return None
+        bx = clamp(match.ball.landing_x, 0.0, config.pitch_width)
+        by = clamp(match.ball.landing_y, 0.0, config.pitch_height)
+        run_dist = distance(player.state.x, player.state.y, bx, by)
+        reach_time = run_dist / max(0.1, player.derived.move_speed * player.state.stamina)
+        if reach_time > playable_time + 0.7:
+            return None
+        if distance(player.state.x, player.state.y, bx, by) < 1.8:
+            mode = ReceiveMode.MEET_BALL
+        elif (bx - player.state.x) * (1 if match.ball.vx >= 0 else -1) > 0:
+            mode = ReceiveMode.RUN_ONTO
+        else:
+            mode = ReceiveMode.COME_SHORT
+        player.state.intercept_x = bx
+        player.state.intercept_y = by
+        player.state.intercept_locked_until = match.time_seconds + min(1.2, max(0.5, playable_time))
+        player.state.receive_mode = mode
+        return (bx, by, mode)
     path = predict_ball_path(match.ball.x, match.ball.y, match.ball.vx, match.ball.vy, config, steps=14)
     best = None
     best_cost = 999.0
@@ -841,7 +864,11 @@ def score_best_pass(
             - facing_penalty * 0.9
             - preview.lane_static_penalty
             - preview.lane_dynamic_penalty
-            - preview.terminal_pressure * config.pass_terminal_pressure_weight
+            - preview.terminal_pressure * (
+                config.lofted_pass_terminal_pressure_weight
+                if preview.flight_type == BallFlightType.LOFTED
+                else config.pass_terminal_pressure_weight
+            )
             + receiver_shot_bonus
             + cutback_bonus
         )
@@ -866,6 +893,10 @@ def _build_pass_intent(target: Player, preview: PassPreview) -> Intent:
         target.player_id,
         preview.pass_type,
         preview.ball_speed,
+        preview.flight_type,
+        preview.landing_x,
+        preview.landing_y,
+        preview.vertical_speed,
     )
 
 
