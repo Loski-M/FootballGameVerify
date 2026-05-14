@@ -21,6 +21,12 @@ class MatchConfig:
     pass_speed_type_through_bonus: float = 2.0
     pass_speed_type_lead_bonus: float = 1.0
     pass_speed_pressure_malus: float = 2.5
+    pass_intercept_sample_dt: float = 0.1
+    pass_intercept_time_margin: float = 0.15
+    pass_intercept_hard_block_margin: float = 0.05
+    pass_dynamic_lane_weight: float = 1.3
+    pass_terminal_pressure_weight: float = 0.55
+    pass_dribble_safety_margin: float = 0.35
 
     # --- Dynamic lead distance ---
     # Lead distance = base + receiver_speed * speed_factor + through_extra

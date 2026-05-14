@@ -4,12 +4,12 @@ import math
 import random
 
 from python_sim.config import MatchConfig
+from python_sim.pass_logic import PassPreview, preview_pass_option
 from python_sim.models import (
     Intent,
     MatchState,
     Player,
     PlayerAction,
-    PassType,
     ReceiveMode,
     Role,
     Team,
@@ -262,11 +262,9 @@ def decide_ball_owner(
     rng: random.Random,
 ) -> Intent:
     if player.role == Role.GK:
-        pass_target, _ = score_best_pass(match, team, player, config)
-        if pass_target is not None:
-            pass_type = choose_pass_type(team, player, pass_target, 99.0, config)
-            pass_speed = choose_pass_speed(player, pass_target, pass_type, 99.0, config)
-            return Intent(PlayerAction.PASS, pass_target.state.x, pass_target.state.y, pass_target.player_id, pass_type, pass_speed)
+        pass_target, _, pass_preview = score_best_pass(match, team, player, config)
+        if pass_target is not None and pass_preview is not None:
+            return _build_pass_intent(pass_target, pass_preview)
         return Intent(PlayerAction.DRIBBLE, player.state.x + team.attack_direction * 1.5, player.state.y)
     nearest_defender = nearest_opponent(match, player)
     defender_dist = (
@@ -277,20 +275,22 @@ def decide_ball_owner(
     
     # Force a pass for any restart (kickoff, throw-in, corner, goal kick)
     if match.restart_reason and match.ball.last_touch_action is None:
-        pass_target, _ = score_best_pass(match, team, player, config)
-        if pass_target is not None:
-            pass_type = choose_pass_type(team, player, pass_target, defender_dist, config)
-            pass_speed = choose_pass_speed(player, pass_target, pass_type, defender_dist, config)
-            return Intent(PlayerAction.PASS, pass_target.state.x, pass_target.state.y, pass_target.player_id, pass_type, pass_speed)
+        pass_target, _, pass_preview = score_best_pass(match, team, player, config)
+        if pass_target is not None and pass_preview is not None:
+            return _build_pass_intent(pass_target, pass_preview)
         else:
             mate = min([p for p in team.players if p.player_id != player.player_id],
                        key=lambda p: distance(player.state.x, player.state.y, p.state.x, p.state.y))
-            pass_speed = choose_pass_speed(player, mate, PassType.TO_FEET, defender_dist, config)
-            return Intent(PlayerAction.PASS, mate.state.x, mate.state.y, mate.player_id, PassType.TO_FEET, pass_speed)
+            fallback_preview = preview_pass_option(match, team, player, mate, config)
+            return _build_pass_intent(mate, fallback_preview)
 
     shoot_score = score_shot(match, team, player, defender_dist, config)
-    pass_target, pass_score = score_best_pass(match, team, player, config)
     dribble_score = score_dribble(match, team, player, defender_dist, config)
+    pass_target, pass_score, pass_preview = score_best_pass(match, team, player, config)
+    if pass_target is not None and pass_score < dribble_score + config.pass_dribble_safety_margin:
+        pass_target = None
+        pass_preview = None
+        pass_score = -999.0
 
     noisy = [
         (PlayerAction.SHOOT, shoot_score + rng.uniform(-0.1, 0.1), None),
@@ -298,10 +298,8 @@ def decide_ball_owner(
         (PlayerAction.DRIBBLE, dribble_score + rng.uniform(-0.1, 0.1), None),
     ]
     best_action, _, target = max(noisy, key=lambda item: item[1])
-    if best_action == PlayerAction.PASS and target is not None:
-        pass_type = choose_pass_type(team, player, target, defender_dist, config)
-        pass_speed = choose_pass_speed(player, target, pass_type, defender_dist, config)
-        return Intent(PlayerAction.PASS, target.state.x, target.state.y, target.player_id, pass_type, pass_speed)
+    if best_action == PlayerAction.PASS and target is not None and pass_preview is not None:
+        return _build_pass_intent(target, pass_preview)
     if best_action == PlayerAction.SHOOT:
         goal_x = config.pitch_width if team.attack_direction == 1 else 0.0
         half_h = config.pitch_height / 2
@@ -355,48 +353,6 @@ def decide_off_ball(match: MatchState, team: Team, player: Player, config: Match
     target_x, target_y, action = defending_target(match, team, player, config)
     player.state.receive_mode = ReceiveMode.NONE
     return Intent(action, target_x, target_y)
-
-
-def choose_pass_type(team: Team, player: Player, target: Player, nearest_defender_dist: float, config: MatchConfig) -> PassType:
-    dist = distance(player.state.x, player.state.y, target.state.x, target.state.y)
-    forward_value = (target.state.x - player.state.x) * team.attack_direction
-    lateral_gap = abs(target.state.y - player.state.y)
-    if (
-        target.role == Role.PIVOT
-        and forward_value > 3.0
-        and dist > 5.0
-        and nearest_defender_dist > 1.8
-        and team.state.phase == TeamPhase.POSSESSION_ATTACK
-    ):
-        return PassType.THROUGH_PASS
-    # Short passes always go to feet — no lead time needed and error is lower
-    if dist <= 6.0:
-        return PassType.TO_FEET
-    if forward_value > 2.0 or lateral_gap > 4.0 or dist > 10.0:
-        return PassType.LEAD_PASS
-    return PassType.TO_FEET
-
-
-def choose_pass_speed(
-    player: Player,
-    target: Player,
-    pass_type: PassType,
-    nearest_defender_dist: float,
-    config: MatchConfig,
-) -> float:
-    dist = distance(player.state.x, player.state.y, target.state.x, target.state.y)
-    speed = config.pass_speed_min + dist * config.pass_speed_distance_per_m
-    if pass_type == PassType.THROUGH_PASS:
-        speed += config.pass_speed_type_through_bonus
-    elif pass_type == PassType.LEAD_PASS:
-        speed += config.pass_speed_type_lead_bonus
-    if nearest_defender_dist < 3.0:
-        speed += (3.0 - nearest_defender_dist) * config.pass_speed_pressure_malus
-    quality = player.derived.pass_quality / 100.0
-    max_speed = config.pass_speed_min + (config.pass_speed_max - config.pass_speed_min) * quality
-    # Ensure the ball can physically reach the target under deceleration
-    min_reach_speed = math.sqrt(2.0 * config.ball_deceleration * dist * 1.05)
-    return clamp(speed, max(config.pass_speed_min, min_reach_speed), max_speed)
 
 
 def choose_intercept_point(match: MatchState, player: Player, config: MatchConfig) -> tuple[float, float, ReceiveMode] | None:
@@ -842,35 +798,29 @@ def score_best_pass(
     team: Team,
     player: Player,
     config: MatchConfig,
-) -> tuple[Player | None, float]:
+) -> tuple[Player | None, float, PassPreview | None]:
     best_target = None
     best_score = -999.0
+    best_preview = None
     owner_x = player.state.x
-    opponents = get_opponent_team(match, team.team_id).players
     for mate in team.players:
         if mate.player_id == player.player_id:
             continue
         dist = distance(owner_x, player.state.y, mate.state.x, mate.state.y)
         if dist > config.support_distance * 1.8:
             continue
-            
-        # Passing lane block evaluation
-        lane_penalty = 0.0
-        for opp in opponents:
-            d_to_lane = distance_to_segment(opp.state.x, opp.state.y, player.state.x, player.state.y, mate.state.x, mate.state.y)
-            if d_to_lane < 1.8:
-                # The closer the opponent is to the passing lane, the higher the penalty
-                # Also, blocks closer to the passer are more dangerous.
-                dist_to_passer = distance(player.state.x, player.state.y, opp.state.x, opp.state.y)
-                proximity_factor = 1.0 + max(0.0, (5.0 - dist_to_passer) * 0.2)
-                lane_penalty += (1.8 - d_to_lane) * 3.5 * proximity_factor
-                
-        forward_value = (mate.state.x - owner_x) * team.attack_direction
+
+        preview = preview_pass_option(match, team, player, mate, config)
+        if preview.is_blocked:
+            continue
+
+        actual_dist = distance(player.state.x, player.state.y, preview.target_x, preview.target_y)
+        forward_value = (preview.target_x - owner_x) * team.attack_direction
         open_value = nearest_defender_distance(match, mate)
         role_bias = -1.2 if mate.role == Role.GK else 0.0
         if mate.role == Role.PIVOT:
             role_bias += 0.5
-        facing_penalty = abs(normalize_angle(angle_to(player.state.x, player.state.y, mate.state.x, mate.state.y) - player.state.facing_angle)) / math.pi
+        facing_penalty = abs(normalize_angle(angle_to(player.state.x, player.state.y, preview.target_x, preview.target_y) - player.state.facing_angle)) / math.pi
         receiver_shot_bonus = _eval_receiver_shot_opportunity(mate, team, config) * 0.5
         # Cutback bonus: when close to opponent goal at a wide angle,
         # passing to a more central teammate is a high-quality chance
@@ -886,23 +836,37 @@ def score_best_pass(
             player.derived.pass_quality / 26.0
             + forward_value * 0.3
             + open_value * 0.35
-            - dist * 0.08
+            - actual_dist * 0.08
             + role_bias
             - facing_penalty * 0.9
-            - lane_penalty
+            - preview.lane_static_penalty
+            - preview.lane_dynamic_penalty
+            - preview.terminal_pressure * config.pass_terminal_pressure_weight
             + receiver_shot_bonus
             + cutback_bonus
         )
         # Central progression: reward passes from wide to central areas
         half_h = config.pitch_height / 2
         passer_lateral = abs(player.state.y - half_h)
-        receiver_lateral = abs(mate.state.y - half_h)
+        receiver_lateral = abs(preview.target_y - half_h)
         if receiver_lateral < passer_lateral - 1.5:
             score += (passer_lateral - receiver_lateral) * 0.18
         if score > best_score:
             best_score = score
             best_target = mate
-    return best_target, best_score
+            best_preview = preview
+    return best_target, best_score, best_preview
+
+
+def _build_pass_intent(target: Player, preview: PassPreview) -> Intent:
+    return Intent(
+        PlayerAction.PASS,
+        preview.target_x,
+        preview.target_y,
+        target.player_id,
+        preview.pass_type,
+        preview.ball_speed,
+    )
 
 
 def nearest_defender_distance(match: MatchState, player: Player) -> float:
